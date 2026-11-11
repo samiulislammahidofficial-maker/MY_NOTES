@@ -59,6 +59,8 @@ export interface Notebook {
   updatedAt: number;
   revision: number;
   paper: PaperKind;
+  /** Optional page viewing mode preference ('single' | 'continuous') */
+  pageViewMode?: 'single' | 'continuous';
   /** Optional AES-GCM + PBKDF2 password protection envelope */
   passwordLock?: PasswordEnvelope | null;
 }

@@ -23,6 +23,7 @@ export interface ToolSettings {
   scribbleErase: boolean;
   shapeSnap: boolean;
   rulerVisible: boolean;
+  rulerUnits?: 'metric' | 'imperial';
   /** 0..1 */
   stabilizer: number;
   penOnly: boolean;

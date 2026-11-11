@@ -9,8 +9,10 @@ import {
   bboxIntersectsPolygonBounds,
   eraseCircle,
   fitShape,
+  hitTestRuler,
   insideFraction,
   shapePoints,
+  snapRulerAngle,
   snapToRuler,
   strokeHitsCircle,
   transformStroke,
@@ -20,6 +22,9 @@ import { detectScribble } from './scribble';
 import type { LayerInfo, PaperSpec, SelectionInfo, ToolSettings } from './tools';
 
 export type { ToolSettings } from './tools';
+
+export const RULER_HALF_LEN = 208.4; // 14 cm (~396.85 pt) + 10 pt end caps on each side
+export const RULER_HALF_H = 26;
 
 export interface SurfaceOptions {
   getTool(): ToolSettings;
@@ -35,8 +40,16 @@ export interface SurfaceOptions {
   getZoomRect?(): { x: number; y: number; w: number; h: number } | null;
   /** If true, this surface is a fixed magnified viewport without auto-fit. */
   disableAutoFit?: boolean;
+  /** If true, allow native scroll container to handle vertical scrolling when not drawing. */
+  disableCanvasPanWheel?: boolean;
+  /** If true, fit page to fill the host width & height exactly (used in Continuous Scroll). */
+  fitFullHost?: boolean;
   getTexts?(): TextBox[];
   onCanvasTap?(docPt: { x: number; y: number }): void;
+  onCloseRuler?(): void;
+  onStrokeStart?(): void;
+  getRuler?(): { x: number; y: number; angle: number };
+  onRulerChange?(r: { x: number; y: number; angle: number }): void;
 }
 
 type Mode = 'ink' | 'erase' | 'lasso' | 'shape' | 'pan' | 'laser';
@@ -96,17 +109,29 @@ export class InkSurface {
   private snappedShape: { shape: 'line' | 'rect' | 'ellipse'; pts: Pt[] } | null = null;
   private liveSeed = 0;
   private ruler = { x: 297, y: 420, angle: 0 };
-  private rulerDrag: { kind: 'move' | 'rotate'; startX: number; startY: number; rx: number; ry: number; a0: number } | null = null;
+  private rulerSnapped = true;
+  private rulerDrag: {
+    kind: 'move' | 'rotate';
+    startX: number;
+    startY: number;
+    rx: number;
+    ry: number;
+    a0: number;
+  } | null = null;
+  private rulerTwoFinger: { cx: number; cy: number; angle: number; rx: number; ry: number; ra: number } | null = null;
   private bgCanvas: HTMLCanvasElement | HTMLImageElement | null = null;
   private bgPageKey = '';
 
   constructor(private host: HTMLElement, private opts: SurfaceOptions) {
+    host.style.userSelect = 'none';
+    host.style.webkitUserSelect = 'none';
     for (const c of [this.scene, this.live]) {
-      c.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block';
+      c.style.cssText =
+        'position:absolute;inset:0;width:100%;height:100%;display:block;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none';
       host.appendChild(c);
     }
-    // touch-action:none ONLY on the drawing surface
-    this.live.style.touchAction = 'none';
+    // touch-action:none ONLY on the drawing surface (or pan-y when in continuous scroll passive navigation)
+    this.live.style.touchAction = opts.disableCanvasPanWheel ? 'pan-y pinch-zoom' : 'none';
     this.live.addEventListener('pointerdown', this.onDown);
     this.live.addEventListener('pointermove', this.onMove);
     this.live.addEventListener('pointerup', this.onUp);
@@ -188,9 +213,18 @@ export class InkSurface {
     this.view = v;
     this.invalidate();
   }
+  isStrokeActive() {
+    return this.activeId !== null || this.penDown;
+  }
+
   fit() {
     if (!this.page) return;
-    this.view = fitPage(this.cssW, this.cssH, this.page.width, this.page.height);
+    if (this.opts.fitFullHost) {
+      const scale = this.cssW / Math.max(1, this.page.width);
+      this.view = { scale, tx: 0, ty: 0 };
+    } else {
+      this.view = fitPage(this.cssW, this.cssH, this.page.width, this.page.height);
+    }
     this.invalidate();
   }
   invalidate() {
@@ -219,7 +253,12 @@ export class InkSurface {
       c.height = Math.round(this.cssH * this.dpr);
     }
     if (this.fitted && oldW > 8) {
-      this.view = { ...this.view, tx: this.view.tx + (this.cssW - oldW) / 2, ty: this.view.ty + (this.cssH - oldH) / 2 };
+      if (this.opts.fitFullHost && this.page) {
+        const scale = this.cssW / Math.max(1, this.page.width);
+        this.view = { scale, tx: 0, ty: 0 };
+      } else {
+        this.view = { ...this.view, tx: this.view.tx + (this.cssW - oldW) / 2, ty: this.view.ty + (this.cssH - oldH) / 2 };
+      }
     }
     this.maybeFit();
     this.invalidate();
@@ -475,20 +514,14 @@ export class InkSurface {
       }
       ctx.globalAlpha = 1;
     }
-    if (tool.rulerVisible && !this.opts.disableAutoFit) {
-      ctx.save();
-      ctx.translate(this.ruler.x, this.ruler.y);
-      ctx.rotate(this.ruler.angle);
-      ctx.fillStyle = '#ffffff26';
-      ctx.strokeStyle = '#0a84ff';
-      ctx.lineWidth = 1.5 / sc;
-      ctx.fillRect(-160, -10, 320, 20);
-      ctx.strokeRect(-160, -10, 320, 20);
-      ctx.fillStyle = '#ffffffaa';
-      ctx.font = `${10 / sc}px sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.fillText(`${Math.round((this.ruler.angle * 180) / Math.PI)}°`, 0, 4 / sc);
-      ctx.restore();
+    if (tool.rulerVisible) {
+      if (this.opts.getRuler) {
+        const ext = this.opts.getRuler();
+        this.ruler.x = ext.x;
+        this.ruler.y = ext.y;
+        this.ruler.angle = ext.angle;
+      }
+      this.drawPhysicalRuler(ctx, sc, tool);
     }
     const zr = this.opts.getZoomRect?.();
     if (zr && !this.opts.disableAutoFit) {
@@ -499,6 +532,171 @@ export class InkSurface {
       ctx.strokeRect(zr.x, zr.y, zr.w, zr.h);
     }
     this.emitSelection();
+  }
+
+  private drawPhysicalRuler(ctx: CanvasRenderingContext2D, sc: number, tool: ToolSettings) {
+    const darkPaper = isDark(this.opts.getPaper().color);
+    const units = tool.rulerUnits ?? 'metric';
+    const halfLen = RULER_HALF_LEN;
+    const halfH = RULER_HALF_H;
+    const w = halfLen * 2;
+    const h = halfH * 2;
+
+    ctx.save();
+    ctx.translate(this.ruler.x, this.ruler.y);
+    ctx.rotate(this.ruler.angle);
+
+    // Restrained drop shadow
+    ctx.save();
+    ctx.shadowColor = darkPaper ? 'rgba(0, 0, 0, 0.52)' : 'rgba(15, 23, 42, 0.22)';
+    ctx.shadowBlur = 10 / sc;
+    ctx.shadowOffsetY = 2.5 / sc;
+    ctx.beginPath();
+    ctx.roundRect(-halfLen, -halfH, w, h, 7);
+    ctx.fillStyle = darkPaper ? 'rgba(32, 36, 44, 0.86)' : 'rgba(246, 248, 252, 0.88)';
+    ctx.fill();
+    ctx.restore();
+
+    // Fine border & active straightedge highlight along top & bottom edges
+    ctx.beginPath();
+    ctx.roundRect(-halfLen, -halfH, w, h, 7);
+    ctx.lineWidth = 1 / sc;
+    ctx.strokeStyle = darkPaper ? 'rgba(255, 255, 255, 0.18)' : 'rgba(15, 23, 42, 0.22)';
+    ctx.stroke();
+
+    // Subtle blue straightedge guide along top and bottom ink edges
+    ctx.strokeStyle = this.rulerSnapped ? 'rgba(10, 132, 255, 0.88)' : 'rgba(10, 132, 255, 0.58)';
+    ctx.lineWidth = 1.4 / sc;
+    ctx.beginPath();
+    ctx.moveTo(-halfLen + 6, -halfH);
+    ctx.lineTo(halfLen - 6, -halfH);
+    ctx.moveTo(-halfLen + 6, halfH);
+    ctx.lineTo(halfLen - 6, halfH);
+    ctx.stroke();
+
+    // Graduated ticks & major interval labels
+    const tickColorMajor = darkPaper ? 'rgba(248, 250, 252, 0.95)' : 'rgba(15, 23, 42, 0.92)';
+    const tickColorMinor = darkPaper ? 'rgba(203, 213, 225, 0.68)' : 'rgba(51, 65, 85, 0.62)';
+    const labelColor = darkPaper ? '#F1F5F9' : '#0F172A';
+
+    ctx.font = `600 ${Math.max(5.5, 7.5)}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    if (units === 'metric') {
+      // 14 cm total (140 mm), 1 mm = 72 / 25.4 pt ≈ 2.83464567 pt
+      const mmPt = 72 / 25.4;
+      const startX = -70 * mmPt; // -198.425 pt
+      for (let mm = 0; mm <= 140; mm++) {
+        const x = startX + mm * mmPt;
+        const isCm = mm % 10 === 0;
+        const isHalfCm = mm % 5 === 0 && !isCm;
+        const topTickLen = isCm ? 9.5 : isHalfCm ? 6.2 : 3.4;
+        const botTickLen = isCm ? 7.2 : isHalfCm ? 4.8 : 2.6;
+
+        ctx.strokeStyle = isCm ? tickColorMajor : tickColorMinor;
+        ctx.lineWidth = (isCm ? 1.15 : 0.75) / sc;
+        ctx.beginPath();
+        // Top graduated edge
+        ctx.moveTo(x, -halfH);
+        ctx.lineTo(x, -halfH + topTickLen);
+        // Bottom graduated edge
+        ctx.moveTo(x, halfH);
+        ctx.lineTo(x, halfH - botTickLen);
+        ctx.stroke();
+
+        if (isCm) {
+          const cmVal = mm / 10;
+          // Skip labels that would collide with the compact center capsule (cm 5..9) only on the bottom; keep top numbers clear!
+          ctx.fillStyle = labelColor;
+          ctx.fillText(cmVal === 0 ? '0 cm' : String(cmVal), x, -halfH + 10.5);
+        }
+      }
+    } else {
+      // Imperial: 5.5 inches = 88 sixteenths, 1/16 in = 4.5 pt
+      const stepPt = 72 / 16;
+      const startX = -44 * stepPt; // -198 pt
+      for (let s16 = 0; s16 <= 88; s16++) {
+        const x = startX + s16 * stepPt;
+        const isInch = s16 % 16 === 0;
+        const isHalf = s16 % 8 === 0 && !isInch;
+        const isQuarter = s16 % 4 === 0 && !isInch && !isHalf;
+        const topTickLen = isInch ? 9.5 : isHalf ? 7.0 : isQuarter ? 5.0 : 3.0;
+        const botTickLen = isInch ? 7.2 : isHalf ? 5.2 : isQuarter ? 3.8 : 2.2;
+
+        ctx.strokeStyle = isInch ? tickColorMajor : tickColorMinor;
+        ctx.lineWidth = (isInch ? 1.15 : 0.75) / sc;
+        ctx.beginPath();
+        ctx.moveTo(x, -halfH);
+        ctx.lineTo(x, -halfH + topTickLen);
+        ctx.moveTo(x, halfH);
+        ctx.lineTo(x, halfH - botTickLen);
+        ctx.stroke();
+
+        if (isInch) {
+          const inVal = s16 / 16;
+          ctx.fillStyle = labelColor;
+          ctx.fillText(inVal === 0 ? '0 in' : String(inVal), x, -halfH + 10.5);
+        }
+      }
+    }
+
+    // Central drag grip dots (left of capsule, away from ink edges)
+    ctx.fillStyle = darkPaper ? 'rgba(255, 255, 255, 0.35)' : 'rgba(15, 23, 42, 0.32)';
+    for (const gx of [-92, -86, -80]) {
+      for (const gy of [-2.2, 2.8]) {
+        ctx.beginPath();
+        ctx.arc(gx, gy, 1.1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Tidy contextual control capsule along perp = 0 (away from top/bottom ink edges)
+    const capBg = darkPaper ? 'rgba(18, 20, 26, 0.92)' : 'rgba(255, 255, 255, 0.94)';
+    const capBorder = darkPaper ? 'rgba(255, 255, 255, 0.18)' : 'rgba(15, 23, 42, 0.18)';
+    ctx.beginPath();
+    ctx.roundRect(-68, -9.5, 146, 19, 9.5);
+    ctx.fillStyle = capBg;
+    ctx.fill();
+    ctx.lineWidth = 0.9 / sc;
+    ctx.strokeStyle = capBorder;
+    ctx.stroke();
+
+    const deg = snapRulerAngle(this.ruler.angle, 2.5, true).deg;
+    ctx.textBaseline = 'middle';
+    ctx.font = `600 7.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+
+    // 1. Rotate handle (-52, 0)
+    ctx.fillStyle = '#0A84FF';
+    ctx.beginPath();
+    ctx.arc(-52, 0, 6.8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText('↻', -52, 0.5);
+
+    // 2. Angle readout (-16, 0)
+    ctx.fillStyle = this.rulerSnapped ? '#0A84FF' : labelColor;
+    ctx.fillText(`${deg}°`, -16, 0.5);
+
+    // 3. Reset 0° button (+26, 0)
+    ctx.fillStyle = darkPaper ? 'rgba(255,255,255,0.12)' : 'rgba(15,23,42,0.08)';
+    ctx.beginPath();
+    ctx.roundRect(12, -6.5, 28, 13, 6.5);
+    ctx.fill();
+    ctx.fillStyle = labelColor;
+    ctx.font = `600 6.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.fillText('0°', 26, 0.5);
+
+    // 4. Close button (+62, 0)
+    ctx.fillStyle = darkPaper ? 'rgba(255, 69, 58, 0.22)' : 'rgba(255, 69, 58, 0.16)';
+    ctx.beginPath();
+    ctx.arc(62, 0, 6.8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#FF453A';
+    ctx.font = `700 8px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+    ctx.fillText('×', 62, 0.5);
+
+    ctx.restore();
   }
 
   private smoothing(tool: ToolSettings) {
@@ -583,6 +781,76 @@ export class InkSurface {
     if (e.pointerType === 'touch') this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const tool = this.opts.getTool();
     const mode = this.modeFor(tool);
+    const d = this.doc(e);
+
+    // Two-finger gesture: check if both touches are on the ruler body for two-finger ruler rotation/move
+    if (e.pointerType === 'touch' && this.touches.size >= 2) {
+      this.cancelSession();
+      if (tool.rulerVisible && !this.opts.disableAutoFit) {
+        const pts = [...this.touches.values()].slice(0, 2);
+        const d0 = this.doc({ clientX: pts[0].x, clientY: pts[0].y });
+        const d1 = this.doc({ clientX: pts[1].x, clientY: pts[1].y });
+        const h0 = hitTestRuler(d0, 'touch', this.ruler, this.view.scale, RULER_HALF_LEN, RULER_HALF_H);
+        const h1 = hitTestRuler(d1, 'touch', this.ruler, this.view.scale, RULER_HALF_LEN, RULER_HALF_H);
+        if (h0 && h1) {
+          this.rulerTwoFinger = {
+            cx: (d0.x + d1.x) / 2,
+            cy: (d0.y + d1.y) / 2,
+            angle: Math.atan2(d1.y - d0.y, d1.x - d0.x),
+            rx: this.ruler.x,
+            ry: this.ruler.y,
+            ra: this.ruler.angle,
+          };
+          return;
+        }
+      }
+      this.beginNav();
+      return;
+    }
+
+    // Check ruler controls/manipulation before pen-only touch rejection so finger/mouse can move/rotate/close the ruler,
+    // while a pen moving along the ruler edge always creates ink ('ink') and never drags the ruler.
+    if (tool.rulerVisible && !this.opts.disableAutoFit && this.activeId === null && !this.penDown) {
+      const rHit = hitTestRuler(d, e.pointerType, this.ruler, this.view.scale, RULER_HALF_LEN, RULER_HALF_H);
+      if (rHit === 'close') {
+        e.preventDefault();
+        this.touches.delete(e.pointerId);
+        this.opts.onCloseRuler?.();
+        return;
+      }
+      if (rHit === 'reset') {
+        e.preventDefault();
+        this.touches.delete(e.pointerId);
+        this.ruler.angle = 0;
+        this.rulerSnapped = true;
+        this.opts.onRulerChange?.({ ...this.ruler });
+        this.liveDirty = true;
+        this.schedule();
+        return;
+      }
+      if (rHit === 'move' || rHit === 'rotate') {
+        e.preventDefault();
+        try {
+          this.live.setPointerCapture(e.pointerId);
+        } catch {
+          /* synthetic pointer */
+        }
+        this.activeId = e.pointerId;
+        this.activeType = e.pointerType;
+        const vx = d.x - this.ruler.x,
+          vy = d.y - this.ruler.y;
+        this.rulerDrag = {
+          kind: rHit,
+          startX: d.x,
+          startY: d.y,
+          rx: this.ruler.x,
+          ry: this.ruler.y,
+          a0: Math.atan2(vy, vx) - this.ruler.angle,
+        };
+        return;
+      }
+    }
+
     let action = arbitrate(e.pointerType, {
       penOnly: tool.penOnly,
       fingerDrawing: tool.fingerDrawing,
@@ -591,11 +859,8 @@ export class InkSurface {
       guardMs: 250,
       touchCount: this.touches.size,
     });
-    if (mode === 'pan' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown) action = 'ink';
-    if (e.pointerType === 'touch' && this.touches.size >= 2) {
-      this.cancelSession();
-      this.beginNav();
-      return;
+    if (mode === 'pan' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown && !this.opts.disableCanvasPanWheel) {
+      action = 'ink';
     }
     if (action !== 'ink' || this.activeId !== null) return;
     e.preventDefault();
@@ -604,19 +869,7 @@ export class InkSurface {
     this.activeType = e.pointerType;
     this.mode = mode;
     if (e.pointerType === 'pen') this.penDown = true;
-    const d = this.doc(e);
-    if (tool.rulerVisible && !this.opts.disableAutoFit) {
-      const dx = Math.cos(this.ruler.angle), dy = Math.sin(this.ruler.angle);
-      const vx = d.x - this.ruler.x, vy = d.y - this.ruler.y;
-      const along = vx * dx + vy * dy, perp = -vx * dy + vy * dx;
-      if (Math.abs(along) <= 160 && Math.abs(perp) <= 10) {
-        this.rulerDrag = {
-          kind: Math.abs(along) > 120 ? 'rotate' : 'move',
-          startX: d.x, startY: d.y, rx: this.ruler.x, ry: this.ruler.y, a0: Math.atan2(vy, vx) - this.ruler.angle,
-        };
-        return;
-      }
-    }
+    this.opts.onStrokeStart?.();
     if (mode !== 'lasso' && this.sel) this.clearSelection();
     if (tool.kind === 'text') {
       this.activeId = null;
@@ -661,7 +914,15 @@ export class InkSurface {
     const r = this.rect();
     for (const ev of evs) {
       let d = clientToDoc(ev.clientX, ev.clientY, r, this.view);
-      if (tool.rulerVisible) d = snapToRuler(d, this.ruler.x, this.ruler.y, this.ruler.angle);
+      if (tool.rulerVisible) {
+        if (this.opts.getRuler) {
+          const ext = this.opts.getRuler();
+          this.ruler.x = ext.x;
+          this.ruler.y = ext.y;
+          this.ruler.angle = ext.angle;
+        }
+        d = snapToRuler(d, this.ruler.x, this.ruler.y, this.ruler.angle, 18, RULER_HALF_H, RULER_HALF_LEN);
+      }
       const p = resolvePressure(ev.pointerType, ev.pressure, tool.constantPressure);
       this.buf.push(d.x, d.y, p, ev.tiltX || 0, ev.tiltY || 0, ev.timeStamp - this.t0);
     }
@@ -689,6 +950,23 @@ export class InkSurface {
   private onMove = (e: PointerEvent) => {
     if (e.pointerType === 'touch' && this.touches.has(e.pointerId)) {
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.rulerTwoFinger && this.touches.size >= 2) {
+        const pts = [...this.touches.values()].slice(0, 2);
+        const d0 = this.doc({ clientX: pts[0].x, clientY: pts[0].y });
+        const d1 = this.doc({ clientX: pts[1].x, clientY: pts[1].y });
+        const cx = (d0.x + d1.x) / 2;
+        const cy = (d0.y + d1.y) / 2;
+        const rawAngle = this.rulerTwoFinger.ra + (Math.atan2(d1.y - d0.y, d1.x - d0.x) - this.rulerTwoFinger.angle);
+        const snapped = snapRulerAngle(rawAngle, 2.5, e.shiftKey || e.altKey);
+        this.ruler.x = this.rulerTwoFinger.rx + (cx - this.rulerTwoFinger.cx);
+        this.ruler.y = this.rulerTwoFinger.ry + (cy - this.rulerTwoFinger.cy);
+        this.ruler.angle = snapped.angle;
+        this.rulerSnapped = snapped.snapped;
+        this.opts.onRulerChange?.({ ...this.ruler });
+        this.liveDirty = true;
+        this.schedule();
+        return;
+      }
       if (this.navLast && this.touches.size >= 2) {
         this.updateNav();
         return;
@@ -701,8 +979,12 @@ export class InkSurface {
         this.ruler.x = this.rulerDrag.rx + (d.x - this.rulerDrag.startX);
         this.ruler.y = this.rulerDrag.ry + (d.y - this.rulerDrag.startY);
       } else {
-        this.ruler.angle = Math.atan2(d.y - this.ruler.y, d.x - this.ruler.x) - this.rulerDrag.a0;
+        const rawAngle = Math.atan2(d.y - this.ruler.y, d.x - this.ruler.x) - this.rulerDrag.a0;
+        const snapped = snapRulerAngle(rawAngle, 2.5, e.shiftKey || e.altKey);
+        this.ruler.angle = snapped.angle;
+        this.rulerSnapped = snapped.snapped;
       }
+      this.opts.onRulerChange?.({ ...this.ruler });
       this.liveDirty = true;
       this.schedule();
       return;
@@ -746,7 +1028,10 @@ export class InkSurface {
 
   private onUp = (e: PointerEvent) => {
     this.touches.delete(e.pointerId);
-    if (this.touches.size < 2) this.navLast = null;
+    if (this.touches.size < 2) {
+      this.navLast = null;
+      this.rulerTwoFinger = null;
+    }
     if (e.pointerType === 'pen') {
       this.penDown = false;
       this.lastPenUp = performance.now();
@@ -778,7 +1063,10 @@ export class InkSurface {
 
   private onCancel = (e: PointerEvent) => {
     this.touches.delete(e.pointerId);
-    if (this.touches.size < 2) this.navLast = null;
+    if (this.touches.size < 2) {
+      this.navLast = null;
+      this.rulerTwoFinger = null;
+    }
     if (e.pointerType === 'pen') {
       this.penDown = false;
       this.lastPenUp = performance.now();
@@ -799,6 +1087,7 @@ export class InkSurface {
     clearTimeout(this.holdTimer);
     this.snappedShape = null;
     this.rulerDrag = null;
+    this.rulerTwoFinger = null;
     this.activeId = null;
     this.buf = null;
     this.eraseAt = null;
@@ -1006,6 +1295,9 @@ export class InkSurface {
     this.invalidate();
   }
   private onWheel = (e: WheelEvent) => {
+    if (this.opts.disableCanvasPanWheel && !e.ctrlKey && !e.metaKey) {
+      return;
+    }
     e.preventDefault();
     const r = this.rect();
     if (e.ctrlKey || e.metaKey) {

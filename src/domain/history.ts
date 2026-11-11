@@ -1,4 +1,4 @@
-import type { InkStroke, TextBox } from './types';
+import type { InkStroke, Layer, Page, TextBox } from './types';
 
 /** Mutable target a command operates on. */
 export interface StrokeTarget {
@@ -8,6 +8,8 @@ export interface StrokeTarget {
   replace(pageId: string, remove: InkStroke[], add: InkStroke[]): void;
   addText?(tb: TextBox): void;
   removeText?(pageId: string, id: string): void;
+  insertPage?(notebookId: string, page: Page, layer: Layer, afterPageId?: string): void;
+  removeAddedPage?(notebookId: string, pageId: string, fallbackPageId?: string): void;
 }
 
 export interface Command {
@@ -61,6 +63,22 @@ export class UpdateTextBoxCommand implements Command {
   inverse(t: StrokeTarget) {
     if (this.next) t.removeText?.(this.pageId, this.next.id);
     if (this.prev) t.addText?.(this.prev);
+  }
+}
+
+export class AddPageCommand implements Command {
+  readonly label = 'Add page';
+  constructor(
+    private notebookId: string,
+    private page: Page,
+    private layer: Layer,
+    private afterPageId?: string,
+  ) {}
+  apply(t: StrokeTarget) {
+    t.insertPage?.(this.notebookId, this.page, this.layer, this.afterPageId);
+  }
+  inverse(t: StrokeTarget) {
+    t.removeAddedPage?.(this.notebookId, this.page.id, this.afterPageId);
   }
 }
 

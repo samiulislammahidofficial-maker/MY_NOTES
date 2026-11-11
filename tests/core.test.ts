@@ -1,8 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { clientToDoc, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
-import { AddStrokeCommand, History, ReplaceCommand, type StrokeTarget } from '../src/domain/history';
+import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, type StrokeTarget } from '../src/domain/history';
 import { SampleBuffer, arbitrate, expandEvents, resolvePressure } from '../src/engine/input';
-import { eraseCircle, fitShape, insideFraction, pointInPolygon, shapePoints, snapToRuler, strokeHitsCircle, transformStroke } from '../src/engine/hit';
+import {
+  eraseCircle,
+  fitShape,
+  hitTestRuler,
+  insideFraction,
+  pointInPolygon,
+  shapePoints,
+  snapRulerAngle,
+  snapToRuler,
+  strokeHitsCircle,
+  transformStroke,
+} from '../src/engine/hit';
+import {
+  SWIPE_ADD_THRESHOLD_PX,
+  SWIPE_MIN_DURATION_MS,
+  SwipeToAddController,
+} from '../src/engine/swipeAddPage';
 import { detectScribble } from '../src/engine/scribble';
 import { boundsOf } from '../src/engine/render';
 import { SAMPLE_STRIDE, type InkStroke } from '../src/domain/types';
@@ -248,5 +264,154 @@ describe('phase 3–5: fonts, line segmentation, and AES-GCM password protection
     expect(roundTrip).toEqual(secret);
 
     await expect(decryptJsonPayload('wrong-password', env)).rejects.toThrow('Incorrect password.');
+  });
+});
+
+describe('ruler geometry, angle snapping, and pen-vs-touch arbitration', () => {
+  const ruler = { x: 200, y: 200, angle: 0 };
+
+  it('snaps ruler angle near 0°, ±45°, ±90°, ±135°, and 180° unless freeRotate is active', () => {
+    const near45 = (46.2 * Math.PI) / 180;
+    const s1 = snapRulerAngle(near45);
+    expect(s1.snapped).toBe(true);
+    expect(s1.deg).toBe(45);
+
+    const free = snapRulerAngle(near45, 2.5, true);
+    expect(free.snapped).toBe(false);
+    expect(free.deg).toBe(46);
+
+    const near90 = (-88.4 * Math.PI) / 180;
+    const s2 = snapRulerAngle(near90);
+    expect(s2.snapped).toBe(true);
+    expect(s2.deg).toBe(-90);
+  });
+
+  it('always treats pen along the ruler edge as straightedge ink (never ruler drag)', () => {
+    // Point right on the top graduated edge (y = 200 - 26 = 174)
+    const hitPen = hitTestRuler({ x: 210, y: 174 }, 'pen', ruler, 1);
+    expect(hitPen).toBe('ink');
+
+    // Even over the central body (outside control capsule), pen inks rather than moving the ruler
+    const hitPenBody = hitTestRuler({ x: 120, y: 200 }, 'pen', ruler, 1);
+    expect(hitPenBody).toBe('ink');
+
+    // Touch or mouse on the ruler body drags the ruler
+    const hitTouchBody = hitTestRuler({ x: 120, y: 200 }, 'touch', ruler, 1);
+    expect(hitTouchBody).toBe('move');
+  });
+
+  it('detects rotate, reset, and close controls with >= 44px touch targets', () => {
+    expect(hitTestRuler({ x: 200 - 34, y: 200 }, 'touch', ruler, 1)).toBe('rotate');
+    expect(hitTestRuler({ x: 200 + 18, y: 200 }, 'touch', ruler, 1)).toBe('reset');
+    expect(hitTestRuler({ x: 200 + 44, y: 200 }, 'touch', ruler, 1)).toBe('close');
+    // Outer ends also rotate for touch/mouse
+    expect(hitTestRuler({ x: 200 + 190, y: 200 }, 'touch', ruler, 1)).toBe('rotate');
+  });
+});
+
+describe('deliberate swipe-to-add-page state machine & AddPageCommand', () => {
+  it('commits exactly one page when dragged upward >= threshold and >= min duration', () => {
+    const ctrl = new SwipeToAddController();
+    const s0 = ctrl.start({
+      pointerId: 1,
+      pointerType: 'touch',
+      clientY: 600,
+      timeStamp: 100,
+      activeTouchCount: 1,
+      penDown: false,
+      rulerDragging: false,
+    });
+    expect(s0.state).toBe('dragging');
+
+    // Short pull below threshold stays 'dragging'
+    const s1 = ctrl.move(1, 600 - (SWIPE_ADD_THRESHOLD_PX - 10));
+    expect(s1.state).toBe('dragging');
+    expect(s1.label).toBe('Swipe up to add a page');
+
+    // Pull beyond threshold arms the handle
+    const s2 = ctrl.move(1, 600 - (SWIPE_ADD_THRESHOLD_PX + 12));
+    expect(s2.state).toBe('armed');
+    expect(s2.label).toBe('Release to add page');
+
+    // Release after sufficient duration commits once
+    const res = ctrl.end(1, 100 + SWIPE_MIN_DURATION_MS + 40);
+    expect(res.shouldAddPage).toBe(true);
+    expect(res.snapshot.state).toBe('idle');
+
+    // Duplicate pointerup for the same pointerId cannot commit a second page
+    const dup = ctrl.end(1, 100 + SWIPE_MIN_DURATION_MS + 50);
+    expect(dup.shouldAddPage).toBe(false);
+  });
+
+  it('rejects pen strokes, multi-touch pinch, ruler manipulation, and short bounces', () => {
+    const ctrl = new SwipeToAddController();
+    // Pen rejected immediately
+    const penSnap = ctrl.start({
+      pointerId: 2,
+      pointerType: 'pen',
+      clientY: 600,
+      timeStamp: 0,
+      activeTouchCount: 1,
+      penDown: true,
+      rulerDragging: false,
+    });
+    expect(penSnap.state).toBe('idle');
+
+    // Multi-touch cancelled mid-gesture
+    ctrl.start({
+      pointerId: 3,
+      pointerType: 'touch',
+      clientY: 600,
+      timeStamp: 0,
+      activeTouchCount: 1,
+      penDown: false,
+      rulerDragging: false,
+    });
+    ctrl.move(3, 500);
+    const cancelled = ctrl.move(3, 490, { activeTouchCount: 2 });
+    expect(cancelled.state).toBe('idle');
+
+    // Fast flick shorter than SWIPE_MIN_DURATION_MS does not add a page
+    ctrl.start({
+      pointerId: 4,
+      pointerType: 'touch',
+      clientY: 600,
+      timeStamp: 1000,
+      activeTouchCount: 1,
+      penDown: false,
+      rulerDragging: false,
+    });
+    ctrl.move(4, 500);
+    const flick = ctrl.end(4, 1000 + 20);
+    expect(flick.shouldAddPage).toBe(false);
+  });
+
+  it('AddPageCommand inserts after anchor page and undoes/redoes cleanly', () => {
+    const pageOrder = ['p1', 'p2'];
+    const t: StrokeTarget = {
+      addStroke: () => {},
+      removeStroke: () => {},
+      replace: () => {},
+      insertPage: (_nbId, page, _layer, afterId) => {
+        const idx = afterId ? pageOrder.indexOf(afterId) : -1;
+        if (idx >= 0) pageOrder.splice(idx + 1, 0, page.id);
+        else pageOrder.push(page.id);
+      },
+      removeAddedPage: (_nbId, pageId) => {
+        const idx = pageOrder.indexOf(pageId);
+        if (idx >= 0) pageOrder.splice(idx, 1);
+      },
+    };
+    const h = new History();
+    const newPage = { id: 'p-mid', notebookId: 'nb1', width: 595, height: 842, layerIds: ['l1'], revision: 1 };
+    const newLayer = { id: 'l1', pageId: 'p-mid', name: 'Ink', visible: true, locked: false, opacity: 1 };
+    h.run(new AddPageCommand('nb1', newPage, newLayer, 'p1'), t, 'p-mid');
+    expect(pageOrder).toEqual(['p1', 'p-mid', 'p2']);
+
+    h.undo(t);
+    expect(pageOrder).toEqual(['p1', 'p2']);
+
+    h.redo(t);
+    expect(pageOrder).toEqual(['p1', 'p-mid', 'p2']);
   });
 });

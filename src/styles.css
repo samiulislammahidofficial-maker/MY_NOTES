@@ -906,3 +906,191 @@ button:disabled { opacity: .35; cursor: default; }
   color: var(--accent);
   font-weight: 600;
 }
+
+/* Continuous Scroll & Deliberate Swipe-to-Add-Page (Ruler & Page Swipe Addendum) */
+.continuous-scroll-pane {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px clamp(12px, 3.5vw, 48px) 96px;
+  scroll-behavior: smooth;
+  overscroll-behavior-y: contain;
+}
+.continuous-pages-stack {
+  max-width: 780px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.continuous-page-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.continuous-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+}
+.continuous-page-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.continuous-page-card {
+  position: relative;
+  width: 100%;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1.5px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.continuous-page-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 12px 34px rgba(10, 132, 255, 0.22);
+}
+.continuous-canvas-host {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.continuous-page-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+}
+.page-boundary-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+}
+.page-boundary-line {
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+}
+.page-boundary-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: #1e1e22;
+  border: 1px solid #323238;
+  color: #d1d1d6;
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.page-boundary-add-btn:hover {
+  background: rgba(10, 132, 255, 0.16);
+  border-color: var(--accent);
+  color: #fff;
+}
+.bottom-add-page-zone {
+  margin-top: 16px;
+  padding: 18px 16px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.swipe-add-affordance {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+  transition: transform 0.14s ease-out;
+}
+.swipe-add-affordance.dragging,
+.swipe-add-affordance.armed {
+  transition: none;
+  cursor: grabbing;
+}
+.swipe-add-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: rgba(34, 34, 38, 0.92);
+  border: 1.5px dashed rgba(255, 255, 255, 0.24);
+  color: #d8d8de;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.swipe-add-affordance.armed .swipe-add-pill {
+  background: rgba(10, 132, 255, 0.22);
+  border-style: solid;
+  border-color: var(--accent);
+  color: #fff;
+}
+.swipe-add-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  display: grid;
+  place-items: center;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.swipe-add-icon.armed {
+  background: var(--accent);
+  color: #fff;
+  transform: scale(1.08);
+}
+.swipe-add-progress-track {
+  width: 44px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+.swipe-add-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.06s linear;
+}
+.bottom-explicit-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 46px;
+  padding: 0 18px;
+  border-radius: 999px;
+  background: #232328;
+  border: 1px solid #3a3a42;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+.bottom-explicit-add-btn:hover {
+  background: rgba(10, 132, 255, 0.15);
+  border-color: var(--accent);
+}
+@media (prefers-reduced-motion: reduce) {
+  .continuous-scroll-pane {
+    scroll-behavior: auto;
+  }
+  .swipe-add-affordance,
+  .swipe-add-icon,
+  .swipe-add-progress-fill {
+    transition: none;
+  }
+}

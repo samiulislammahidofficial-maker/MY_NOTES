@@ -179,13 +179,107 @@ export function fitShape(samples: Float32Array): { shape: 'line' | 'rect' | 'ell
   return null;
 }
 
-/** Project point onto a ruler line (point p0, angle rad) if within snap distance. */
-export function snapToRuler(p: Pt, rx: number, ry: number, angleRad: number, snapDist = 18): Pt {
-  const dx = Math.cos(angleRad), dy = Math.sin(angleRad);
-  const vx = p.x - rx, vy = p.y - ry;
-  const perp = -vx * dy + vy * dx;
-  if (Math.abs(perp) > snapDist) return p;
+/** Project point onto a ruler edge (center rx, ry, angle rad) if within snap distance along the ruler length. */
+export function snapToRuler(
+  p: Pt,
+  rx: number,
+  ry: number,
+  angleRad: number,
+  snapDist = 18,
+  halfH = 10,
+  halfLen = 220,
+): Pt {
+  const dx = Math.cos(angleRad),
+    dy = Math.sin(angleRad);
+  const vx = p.x - rx,
+    vy = p.y - ry;
   const along = vx * dx + vy * dy;
-  const edgeOffset = perp >= 0 ? 10 : -10;
+  if (Math.abs(along) > halfLen + 10) return p;
+  const perp = -vx * dy + vy * dx;
+  const distToBottom = Math.abs(perp - halfH);
+  const distToTop = Math.abs(perp + halfH);
+  // Support both legacycenter-distance and edge-distance snapping within snapDist
+  if (Math.abs(perp) > halfH + snapDist && distToBottom > snapDist && distToTop > snapDist) {
+    return p;
+  }
+  const edgeOffset = perp >= 0 ? halfH : -halfH;
   return { x: rx + along * dx - edgeOffset * dy, y: ry + along * dy + edgeOffset * dx };
 }
+
+/** Snap ruler angle near 0°, ±45°, ±90°, ±135°, 180° within toleranceDeg. */
+export function snapRulerAngle(
+  angleRad: number,
+  toleranceDeg = 2.5,
+  freeRotate = false,
+): { angle: number; snapped: boolean; deg: number } {
+  let deg = ((angleRad * 180) / Math.PI) % 360;
+  if (deg > 180) deg -= 360;
+  if (deg <= -180) deg += 360;
+  if (!freeRotate) {
+    const targets = [-180, -135, -90, -45, 0, 45, 90, 135, 180];
+    for (const t of targets) {
+      if (Math.abs(deg - t) <= toleranceDeg) {
+        const norm = t === -180 ? 180 : t;
+        return { angle: (norm * Math.PI) / 180, snapped: true, deg: norm };
+      }
+    }
+  }
+  return { angle: (deg * Math.PI) / 180, snapped: false, deg: Math.round(deg) };
+}
+
+export type RulerHitZone = 'ink' | 'move' | 'rotate' | 'reset' | 'close' | null;
+
+/**
+ * Hit-test the physical ruler overlay in document coordinates.
+ * Guarantees >= 44 CSS px hit areas for controls while keeping controls away from the top/bottom ink edges,
+ * and ensures a pen moving along the edge always draws ink rather than dragging the ruler.
+ */
+export function hitTestRuler(
+  p: Pt,
+  pointerType: string,
+  ruler: { x: number; y: number; angle: number },
+  scale = 1,
+  halfLen = 198.4,
+  halfH = 26,
+): RulerHitZone {
+  const dx = Math.cos(ruler.angle),
+    dy = Math.sin(ruler.angle);
+  const vx = p.x - ruler.x,
+    vy = p.y - ruler.y;
+  const along = vx * dx + vy * dy;
+  const perp = -vx * dy + vy * dx;
+
+  // Outside ruler bounding area entirely
+  if (Math.abs(along) > halfLen + 24 / scale || Math.abs(perp) > halfH + 20) {
+    return null;
+  }
+
+  // Pen near either graduated edge always draws ink along the straightedge
+  if (pointerType === 'pen' && Math.abs(perp) >= halfH - 12) {
+    return 'ink';
+  }
+
+  // Hit radius in document units corresponding to at least 44 CSS px diameter (22 CSS px radius)
+  const hitR = Math.max(13, 22 / Math.max(0.25, scale));
+
+  // Control capsule buttons along perp = 0 (center line, away from top/bottom edges):
+  // Rotate knob at along = -52, Reset at along = +26, Close at along = +62
+  if (Math.hypot(along - 62, perp) <= hitR) return 'close';
+  if (Math.hypot(along - 26, perp) <= hitR) return 'reset';
+  if (Math.hypot(along - -52, perp) <= hitR) return 'rotate';
+
+  // If pen is not on a capsule button, it draws ink!
+  if (pointerType === 'pen') {
+    return 'ink';
+  }
+
+  // Touch/mouse inside ruler body (away from outer ink zone)
+  if (Math.abs(along) <= halfLen && Math.abs(perp) <= halfH) {
+    // Outer ends of the ruler body also allow rotation drag
+    if (Math.abs(along) > halfLen - 32) return 'rotate';
+    return 'move';
+  }
+
+  return null;
+}
+

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { PAPER_SIZES, mmToPt, type CustomFontRecord, type PaperSize, type Template, type InkStroke, type Layer, type Notebook, type Page, type PaperKind, type TextBox } from '../domain/types';
-import { AddStrokeCommand, ConvertInkToTextCommand, History, ReplaceCommand, UpdateTextBoxCommand, type StrokeTarget } from '../domain/history';
+import { AddPageCommand, AddStrokeCommand, ConvertInkToTextCommand, History, ReplaceCommand, UpdateTextBoxCommand, type StrokeTarget } from '../domain/history';
 import { repo } from '../storage/db';
 import { loadSavedCustomFonts } from '../fonts/registry';
 import type { ToolKind, ToolSettings } from '../engine/tools';
@@ -78,7 +78,18 @@ interface State {
   geminiOptIn: boolean;
   geminiKey: string;
   geminiModel: string;
+  pageViewMode: 'single' | 'continuous';
+  liveAnnouncement: string;
 }
+
+const initialPageViewMode = ((): 'single' | 'continuous' => {
+  try {
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem('mynotes.pageViewMode') : null;
+    return v === 'continuous' ? 'continuous' : 'single';
+  } catch {
+    return 'single';
+  }
+})();
 
 const initialWelcomed = (() => {
   try {
@@ -114,7 +125,7 @@ export const useApp = create<State>(() => ({
   tool: {
     kind: 'pen', nib: 'ballpoint', strokeStyle: 'solid', color: '#F4F436', rainbow: false, width: mmToPt(0.45), opacity: 1,
     hlColor: '#FFE600', hlWidth: mmToPt(5), hlOpacity: 0.4,
-    eraserMode: 'pixel', eraserRadius: 8, shape: 'line', scribbleErase: true, shapeSnap: true, rulerVisible: false, stabilizer: 0.3,
+    eraserMode: 'pixel', eraserRadius: 8, shape: 'line', scribbleErase: true, shapeSnap: true, rulerVisible: false, rulerUnits: 'metric', stabilizer: 0.3,
     penOnly: true, fingerDrawing: false, constantPressure: 0.5,
   },
   presets: [
@@ -137,6 +148,8 @@ export const useApp = create<State>(() => ({
   geminiOptIn: false,
   geminiKey: '',
   geminiModel: 'gemini-2.5-flash',
+  pageViewMode: initialPageViewMode,
+  liveAnnouncement: '',
 }));
 
 const set = useApp.setState;
@@ -266,6 +279,82 @@ const target: StrokeTarget = {
       }),
     );
   },
+  insertPage(notebookId, page, layer, afterPageId) {
+    const nb = get().notebooks.find((n) => n.id === notebookId);
+    if (!nb) return;
+    pageNotebook.set(page.id, notebookId);
+    if (!strokesByPage.has(page.id)) strokesByPage.set(page.id, []);
+    if (!textsByPage.has(page.id)) textsByPage.set(page.id, []);
+    if (!layersByPage.has(page.id)) layersByPage.set(page.id, [layer]);
+
+    const curPageIds = nb.pageIds.includes(page.id) ? [...nb.pageIds] : [...nb.pageIds];
+    if (!curPageIds.includes(page.id)) {
+      const idx = afterPageId ? curPageIds.indexOf(afterPageId) : -1;
+      if (idx >= 0) curPageIds.splice(idx + 1, 0, page.id);
+      else curPageIds.push(page.id);
+    }
+
+    const curPages = getPages(notebookId).filter((p) => p.id !== page.id);
+    const pageMap = new Map<string, Page>(curPages.map((p) => [p.id, p]));
+    pageMap.set(page.id, page);
+    const orderedPages = curPageIds.map((pid) => pageMap.get(pid)).filter((p): p is Page => !!p);
+    pagesByNotebook.set(notebookId, orderedPages);
+
+    const updatedNb: Notebook = {
+      ...nb,
+      pageIds: curPageIds,
+      updatedAt: Date.now(),
+      revision: nb.revision + 1,
+    };
+
+    const st = get();
+    const panes = st.panes.map((pn, i) => (i === st.activePane && pn.notebookId === notebookId ? { ...pn, pageId: page.id } : pn));
+    set({
+      notebooks: st.notebooks.map((n) => (n.id === notebookId ? updatedNb : n)),
+      panes,
+      strokeVersion: st.strokeVersion + 1,
+      layerVersion: st.layerVersion + 1,
+    });
+
+    track(
+      (async () => {
+        await repo.createNotebook(updatedNb, page, layer);
+        await persistEncryptedIfLocked(page.id, notebookId);
+      })(),
+    );
+  },
+  removeAddedPage(notebookId, pageId, fallbackPageId) {
+    const nb = get().notebooks.find((n) => n.id === notebookId);
+    if (!nb || nb.pageIds.length <= 1) return;
+    // Do not destroy subsequently written content if strokes or texts remain on this page
+    if (getStrokes(pageId).length > 0 || getTexts(pageId).length > 0) return;
+    const nextPageIds = nb.pageIds.filter((id) => id !== pageId);
+    const nextPages = getPages(notebookId).filter((p) => p.id !== pageId);
+    pagesByNotebook.set(notebookId, nextPages);
+    const updatedNb: Notebook = {
+      ...nb,
+      pageIds: nextPageIds,
+      updatedAt: Date.now(),
+      revision: nb.revision + 1,
+    };
+    const st = get();
+    const fallback = fallbackPageId && nextPageIds.includes(fallbackPageId) ? fallbackPageId : nextPageIds[nextPageIds.length - 1];
+    const panes = st.panes.map((pn) => (pn.notebookId === notebookId && pn.pageId === pageId ? { ...pn, pageId: fallback } : pn));
+    set({
+      notebooks: st.notebooks.map((n) => (n.id === notebookId ? updatedNb : n)),
+      panes,
+      strokeVersion: st.strokeVersion + 1,
+      layerVersion: st.layerVersion + 1,
+    });
+    track(
+      (async () => {
+        await repo.updateNotebook(updatedNb);
+        if (updatedNb.passwordLock && getSessionPassword(notebookId)) {
+          await persistEncryptedIfLocked(fallback, notebookId);
+        }
+      })(),
+    );
+  },
 };
 
 function refreshUndo() {
@@ -377,7 +466,8 @@ export const actions = {
     const panes = [...st.panes];
     panes[idx] = { notebookId: id, pageId: pages[0].id };
     const tabs = st.tabs.includes(id) ? st.tabs : [...st.tabs, id];
-    set({ mode: 'editor', panes, tabs, activePane: idx, paper: nb?.paper ?? '#000000' });
+    const pageViewMode = nb?.pageViewMode ?? st.pageViewMode;
+    set({ mode: 'editor', panes, tabs, activePane: idx, paper: nb?.paper ?? '#000000', pageViewMode });
     refreshUndo();
   },
 
@@ -767,17 +857,47 @@ export const actions = {
     track(repo.saveLayers(page, list));
   },
 
-  async addPage(pane: number) {
+  async addPage(pane: number): Promise<string | null> {
+    return actions.addPageAfter(pane);
+  },
+
+  async addPageAfter(pane: number, afterPageId?: string): Promise<string | null> {
     const p = get().panes[pane];
-    const nb = get().notebooks.find((n) => n.id === p.notebookId);
-    if (!nb) return;
+    const nb = p && get().notebooks.find((n) => n.id === p.notebookId);
+    if (!nb) return null;
     const pageId = crypto.randomUUID();
     const layer: Layer = { id: crypto.randomUUID(), pageId, name: 'Ink', visible: true, locked: false, opacity: 1 };
-    const page: Page = { id: pageId, notebookId: nb.id, width: nb.landscape ? PAPER_SIZES[nb.size].height : PAPER_SIZES[nb.size].width, height: nb.landscape ? PAPER_SIZES[nb.size].width : PAPER_SIZES[nb.size].height, layerIds: [layer.id], revision: 1 };
-    await repo.createNotebook({ ...nb, pageIds: [...nb.pageIds, pageId], updatedAt: Date.now(), revision: nb.revision + 1 }, page, layer);
-    set({ notebooks: await repo.allNotebooks() });
-    await actions.loadNotebook(nb.id);
-    actions.setPage(pane, pageId);
+    // Unprotected page created next to an individually password-locked page does NOT inherit a page password;
+    // if the notebook itself has a passwordLock, insertPage encrypts the notebook envelope via persistEncryptedIfLocked.
+    const page: Page = {
+      id: pageId,
+      notebookId: nb.id,
+      width: nb.landscape ? PAPER_SIZES[nb.size].height : PAPER_SIZES[nb.size].width,
+      height: nb.landscape ? PAPER_SIZES[nb.size].width : PAPER_SIZES[nb.size].height,
+      layerIds: [layer.id],
+      revision: 1,
+    };
+    const anchor = afterPageId ?? nb.pageIds[nb.pageIds.length - 1];
+    actions.setActivePane(pane);
+    history(nb.id).run(new AddPageCommand(nb.id, page, layer, anchor), target, pageId);
+    refreshUndo();
+    const updatedPages = getPages(nb.id);
+    const newIdx = updatedPages.findIndex((x) => x.id === pageId);
+    set({ liveAnnouncement: `Page added, page ${newIdx + 1} of ${updatedPages.length}` });
+    return pageId;
+  },
+
+  setPageViewMode(mode: 'single' | 'continuous') {
+    try {
+      localStorage.setItem('mynotes.pageViewMode', mode);
+    } catch {
+      /* ignore */
+    }
+    const p = get().panes[get().activePane];
+    set({ pageViewMode: mode });
+    if (p) {
+      void actions.patchNotebook(p.notebookId, { pageViewMode: mode });
+    }
   },
 
   async duplicatePage(pane: number, pageId: string) {

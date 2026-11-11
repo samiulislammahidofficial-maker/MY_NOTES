@@ -49,6 +49,7 @@ import { InkSurface } from '../engine/surface';
 import type { SelectionInfo, ShapeKind, ToolKind } from '../engine/tools';
 import { PAPER_COLORS, type InkStroke, type Page, type TextBox } from '../domain/types';
 import { unionBounds } from '../engine/hit';
+import { SwipeToAddController, type SwipeAddSnapshot } from '../engine/swipeAddPage';
 import { StyleColorPopover, type StylePopoverTab } from '../ui/StyleColorPopover';
 import { SYSTEM_FONTS, importCustomFontFile } from '../fonts/registry';
 import {
@@ -346,6 +347,197 @@ function ConvertToTextModal({
   );
 }
 
+function ContinuousPageCard({
+  paneIndex,
+  page,
+  pageIndex,
+  isActivePage,
+  shouldMountCanvas,
+  sharedRulerRef,
+  onRulerSync,
+  onRequestUnlockPage,
+  onSelectStrokesForConvert,
+  onOpenTapBox,
+  onAnyStrokeStart,
+}: {
+  paneIndex: number;
+  page: Page;
+  pageIndex: number;
+  isActivePage: boolean;
+  shouldMountCanvas: boolean;
+  sharedRulerRef: React.MutableRefObject<{ x: number; y: number; angle: number }>;
+  onRulerSync: () => void;
+  onRequestUnlockPage: (page: Page) => void;
+  onSelectStrokesForConvert: (page: Page, strokes: InkStroke[]) => void;
+  onOpenTapBox: (page: Page, pt: { x: number; y: number }) => void;
+  onAnyStrokeStart: () => void;
+}) {
+  const version = useApp((s) => s.strokeVersion);
+  const paper = useApp((s) => s.paper);
+  const kind = useApp((s) => s.tool.kind);
+  const rulerVisible = useApp((s) => s.tool.rulerVisible);
+  const rulerUnits = useApp((s) => s.tool.rulerUnits);
+  const hostRef = useRef<HTMLDivElement>(null);
+  const surfRef = useRef<InkSurface | null>(null);
+  const [sel, setSel] = useState<SelectionInfo | null>(null);
+  const [keepMountedForStroke, setKeepMountedForStroke] = useState(false);
+
+  const mountCanvas = shouldMountCanvas || keepMountedForStroke || isActivePage;
+  const isPageLocked = !!page.passwordLock && !isDocumentUnlockedInSession(page.id);
+
+  useEffect(() => {
+    if (!mountCanvas || !hostRef.current) {
+      if (surfRef.current && !surfRef.current.isStrokeActive()) {
+        surfRef.current.destroy();
+        surfRef.current = null;
+      }
+      return;
+    }
+    const surface = new InkSurface(hostRef.current, {
+      getTool: () => {
+        const t = useApp.getState().tool;
+        return isActivePage ? t : { ...t, rulerVisible: false };
+      },
+      getPaper: () => {
+        const n = useApp.getState().notebooks.find((x) => x.id === page.notebookId);
+        return { color: n?.paper ?? '#000000', template: n?.template ?? 'blank' };
+      },
+      getLayers: () => getLayers(page.id),
+      activeLayerId: () => getActiveLayer(page.id),
+      getTexts: () => getTexts(page.id),
+      onStroke: (st) => {
+        setKeepMountedForStroke(false);
+        actions.commitStroke(st);
+      },
+      onEdit: (label, rm, add) => actions.commitEdit(label, rm, add),
+      onActivate: () => {
+        actions.setActivePane(paneIndex);
+        if (useApp.getState().panes[paneIndex]?.pageId !== page.id) {
+          actions.setPage(paneIndex, page.id);
+        }
+      },
+      onSelection: setSel,
+      onCopy: (list) => actions.copy(list),
+      onCanvasTap: (pt) => onOpenTapBox(page, pt),
+      onCloseRuler: () => actions.setTool({ rulerVisible: false }),
+      onStrokeStart: () => {
+        setKeepMountedForStroke(true);
+        onAnyStrokeStart();
+      },
+      getRuler: () => sharedRulerRef.current,
+      onRulerChange: (r) => {
+        sharedRulerRef.current = r;
+        onRulerSync();
+      },
+      fitFullHost: true,
+      disableCanvasPanWheel: true,
+    });
+    surfRef.current = surface;
+    surface.setPage(page, getStrokes(page.id));
+    return () => {
+      surface.destroy();
+      surfRef.current = null;
+    };
+  }, [mountCanvas, page.id, page.notebookId, paneIndex, isActivePage]);
+
+  useEffect(() => {
+    surfRef.current?.setStrokes(getStrokes(page.id));
+  }, [version, page.id]);
+
+  useEffect(() => {
+    surfRef.current?.invalidate();
+  }, [paper, rulerVisible, rulerUnits, isActivePage]);
+
+  useEffect(() => {
+    if (kind !== 'lasso') surfRef.current?.clearSelection();
+  }, [kind]);
+
+  const act = (a: 'delete' | 'duplicate' | 'cut' | 'copy') => surfRef.current?.selectionAction(a);
+
+  return (
+    <div
+      className={`continuous-page-card ${isActivePage ? 'active' : ''}`}
+      data-page-id={page.id}
+      data-page-index={pageIndex}
+      style={{ aspectRatio: `${page.width} / ${page.height}` }}
+      onPointerDown={() => {
+        if (useApp.getState().panes[paneIndex]?.pageId !== page.id) {
+          actions.setPage(paneIndex, page.id);
+        }
+      }}
+    >
+      <div className="continuous-canvas-host" ref={hostRef} style={{ background: paper }} />
+
+      {!mountCanvas && (
+        <div
+          className="continuous-page-placeholder"
+          style={{ background: paper }}
+          aria-label={`Page ${pageIndex + 1} preview`}
+        >
+          <span>Page {pageIndex + 1}</span>
+        </div>
+      )}
+
+      {isPageLocked && (
+        <div
+          className="page-lock-overlay"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: 'rgba(15, 15, 18, 0.92)',
+            backdropFilter: 'blur(10px)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 12,
+            zIndex: 15,
+          }}
+        >
+          <Lock size={36} color="#1E88FF" />
+          <h3 style={{ margin: 0, fontSize: 18 }}>Page {pageIndex + 1} is Password Protected</h3>
+          <p style={{ margin: 0, fontSize: 13, color: 'var(--muted)' }}>
+            Enter this page’s password to view and edit its notes.
+          </p>
+          <button type="button" className="nn-create" onClick={() => onRequestUnlockPage(page)}>
+            Unlock Page
+          </button>
+        </div>
+      )}
+
+      {sel && kind === 'lasso' && isActivePage && (
+        <div
+          className="sel-menu"
+          role="toolbar"
+          aria-label="Selection actions"
+          style={{ left: Math.max(8, sel.rect.x + sel.rect.w / 2), top: Math.max(8, sel.rect.y - 56) }}
+        >
+          <button onClick={() => act('cut')}>
+            <Scissors size={16} /> Cut
+          </button>
+          <button onClick={() => act('copy')}>
+            <Copy size={16} /> Copy
+          </button>
+          <button onClick={() => act('duplicate')}>
+            <CopyPlus size={16} /> Duplicate
+          </button>
+          <button onClick={() => act('delete')}>
+            <Trash2 size={16} /> Delete
+          </button>
+          <button
+            onClick={() => {
+              const picked = surfRef.current?.getSelectedStrokes() ?? [];
+              if (picked.length) onSelectStrokesForConvert(page, picked);
+            }}
+          >
+            <Type size={16} /> Convert to Text
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Pane({
   index,
   onRequestUnlockPage,
@@ -359,23 +551,36 @@ function Pane({
   const version = useApp((s) => s.strokeVersion);
   const kind = useApp((s) => s.tool.kind);
   const rulerVisible = useApp((s) => s.tool.rulerVisible);
+  const rulerUnits = useApp((s) => s.tool.rulerUnits);
+  const pageViewMode = useApp((s) => s.pageViewMode);
+  const liveAnnouncement = useApp((s) => s.liveAnnouncement);
   const hasClip = useApp((s) => s.hasClipboard);
   const debug = useApp((s) => s.debug);
   const host = useRef<HTMLDivElement>(null);
   const surf = useRef<InkSurface | null>(null);
   const zHost = useRef<HTMLDivElement>(null);
   const zSurf = useRef<InkSurface | null>(null);
+  const scrollWrapRef = useRef<HTMLDivElement>(null);
+  const sharedRulerRef = useRef<{ x: number; y: number; angle: number }>({ x: 297, y: 420, angle: 0 });
+  const swipeCtrlRef = useRef<SwipeToAddController>(new SwipeToAddController());
+  const [swipeSnap, setSwipeSnap] = useState<SwipeAddSnapshot>(swipeCtrlRef.current.getSnapshot());
   const [stats, setStats] = useState('');
   const [sel, setSel] = useState<SelectionInfo | null>(null);
-  const [convertStrokes, setConvertStrokes] = useState<InkStroke[] | null>(null);
-  const [tapBox, setTapBox] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [convertTarget, setConvertTarget] = useState<{ page: Page; strokes: InkStroke[] } | null>(null);
+  const [tapBox, setTapBox] = useState<{ pageId: string; x: number; y: number; text: string } | null>(null);
   const [zoomWin, setZoomWin] = useState({ open: false, x: 40, y: 120, w: 200, h: 65, scale: 2.5 });
   const zoomRef = useRef(zoomWin);
   zoomRef.current = zoomWin;
 
+  const syncRulerSurfaces = () => {
+    surf.current?.invalidate();
+    zSurf.current?.invalidate();
+  };
+
   useEffect(() => {
+    if (pageViewMode !== 'single' || !host.current) return;
     const pageOf = () => useApp.getState().panes[index]?.pageId;
-    const surface = new InkSurface(host.current!, {
+    const surface = new InkSurface(host.current, {
       getTool: () => useApp.getState().tool,
       getPaper: () => {
         const n = useApp.getState().notebooks.find((x) => x.id === useApp.getState().panes[index]?.notebookId);
@@ -390,11 +595,29 @@ function Pane({
       onSelection: setSel,
       onCopy: (list) => actions.copy(list),
       getZoomRect: () => (zoomRef.current.open ? zoomRef.current : null),
-      onCanvasTap: (pt) => setTapBox({ x: pt.x, y: pt.y, text: '' }),
+      onCanvasTap: (pt) => {
+        const pid = pageOf();
+        if (pid) setTapBox({ pageId: pid, x: pt.x, y: pt.y, text: '' });
+      },
+      onCloseRuler: () => actions.setTool({ rulerVisible: false }),
+      onStrokeStart: () => {
+        swipeCtrlRef.current.cancel();
+        setSwipeSnap(swipeCtrlRef.current.getSnapshot());
+      },
+      getRuler: () => sharedRulerRef.current,
+      onRulerChange: (r) => {
+        sharedRulerRef.current = r;
+        syncRulerSurfaces();
+      },
     });
     surf.current = surface;
-    return () => surface.destroy();
-  }, [index]);
+    const page = pane && getPages(pane.notebookId).find((p) => p.id === pane.pageId);
+    if (page) surface.setPage(page, getStrokes(page.id));
+    return () => {
+      surface.destroy();
+      surf.current = null;
+    };
+  }, [index, pageViewMode]);
 
   useEffect(() => {
     if (!zoomWin.open || !zHost.current) return;
@@ -411,6 +634,12 @@ function Pane({
       onStroke: (st) => actions.commitStroke(st),
       onEdit: (label, rm, add) => actions.commitEdit(label, rm, add),
       onActivate: () => actions.setActivePane(index),
+      onCloseRuler: () => actions.setTool({ rulerVisible: false }),
+      getRuler: () => sharedRulerRef.current,
+      onRulerChange: (r) => {
+        sharedRulerRef.current = r;
+        syncRulerSurfaces();
+      },
       disableAutoFit: true,
     });
     zSurf.current = zs;
@@ -432,7 +661,8 @@ function Pane({
 
   useEffect(() => {
     surf.current?.invalidate();
-  }, [rulerVisible]);
+    zSurf.current?.invalidate();
+  }, [rulerVisible, rulerUnits]);
 
   useEffect(() => {
     const page = pane && getPages(pane.notebookId).find((p) => p.id === pane.pageId);
@@ -440,7 +670,7 @@ function Pane({
       surf.current?.setPage(page, getStrokes(page.id));
       zSurf.current?.setPage(page, getStrokes(page.id));
     }
-  }, [pane?.pageId, pane?.notebookId]);
+  }, [pane?.pageId, pane?.notebookId, pageViewMode]);
 
   useEffect(() => {
     if (pane) {
@@ -457,6 +687,20 @@ function Pane({
     if (kind !== 'lasso') surf.current?.clearSelection();
   }, [kind]);
 
+  // Cancel any pending swipe when switching view mode, notebook, or pane
+  useEffect(() => {
+    swipeCtrlRef.current.cancel();
+    setSwipeSnap(swipeCtrlRef.current.getSnapshot());
+  }, [pageViewMode, pane?.notebookId, active]);
+
+  // When switching into Continuous Scroll mode, scroll current active page into view
+  useEffect(() => {
+    if (pageViewMode === 'continuous' && scrollWrapRef.current && pane?.pageId) {
+      const card = scrollWrapRef.current.querySelector(`[data-page-id="${pane.pageId}"]`) as HTMLElement | null;
+      card?.scrollIntoView({ block: 'nearest' });
+    }
+  }, [pageViewMode]);
+
   useEffect(() => {
     if (!debug) return;
     const t = setInterval(() => setStats(JSON.stringify(surf.current?.getStats())), 1000);
@@ -470,15 +714,17 @@ function Pane({
   const act = (a: 'delete' | 'duplicate' | 'cut' | 'copy') => surf.current?.selectionAction(a);
 
   const commitTappedText = () => {
-    if (!tapBox || !currentPage) return;
+    if (!tapBox) return;
+    const targetPage = pages.find((p) => p.id === tapBox.pageId) ?? currentPage;
+    if (!targetPage) return;
     const val = tapBox.text.trim();
     if (val) {
       const st = useApp.getState();
       const tb: TextBox = {
         kind: 'text',
         id: crypto.randomUUID(),
-        pageId: currentPage.id,
-        layerId: getActiveLayer(currentPage.id) ?? currentPage.layerIds[0],
+        pageId: targetPage.id,
+        layerId: getActiveLayer(targetPage.id) ?? targetPage.layerIds[0],
         text: val,
         fontFamily: st.activeFontFamily,
         fontAssetId: st.activeFontAssetId,
@@ -495,43 +741,245 @@ function Pane({
         order: Date.now(),
         revision: 1,
       };
-      actions.commitTextEdit(currentPage.id, null, tb);
+      actions.commitTextEdit(targetPage.id, null, tb);
     }
     setTapBox(null);
   };
 
+  const scrollToAndActivatePage = (pageId: string) => {
+    actions.setPage(index, pageId);
+    if (pageViewMode === 'continuous' && scrollWrapRef.current) {
+      requestAnimationFrame(() => {
+        const el = scrollWrapRef.current?.querySelector(`[data-page-id="${pageId}"]`) as HTMLElement | null;
+        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  };
+
+  const handleAddPageAfterAndScroll = async (afterPageId?: string) => {
+    const newId = await actions.addPageAfter(index, afterPageId);
+    if (newId && pageViewMode === 'continuous') {
+      requestAnimationFrame(() => {
+        const el = scrollWrapRef.current?.querySelector(`[data-page-id="${newId}"]`) as HTMLElement | null;
+        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  };
+
   return (
     <section className={`pane ${active ? 'active' : ''}`} aria-label={`Pane ${index + 1}`}>
-      <div className="canvas-host" ref={host} />
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {liveAnnouncement}
+      </div>
 
-      {isPageLocked && currentPage && (
+      {pageViewMode === 'single' ? (
+        <>
+          <div className="canvas-host" ref={host} />
+
+          {isPageLocked && currentPage && (
+            <div
+              className="page-lock-overlay"
+              style={{
+                position: 'absolute',
+                inset: 0,
+                background: 'rgba(15, 15, 18, 0.92)',
+                backdropFilter: 'blur(10px)',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 12,
+                zIndex: 15,
+              }}
+            >
+              <Lock size={36} color="#1E88FF" />
+              <h3 style={{ margin: 0, fontSize: 18 }}>Page {idx + 1} is Password Protected</h3>
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--muted)' }}>
+                Enter this page’s password to view and edit its notes.
+              </p>
+              <button type="button" className="nn-create" onClick={() => onRequestUnlockPage(currentPage)}>
+                Unlock Page
+              </button>
+            </div>
+          )}
+
+          {sel && kind === 'lasso' && (
+            <div
+              className="sel-menu"
+              role="toolbar"
+              aria-label="Selection actions"
+              style={{ left: Math.max(8, sel.rect.x + sel.rect.w / 2), top: Math.max(8, sel.rect.y - 56) }}
+            >
+              <button onClick={() => act('cut')}>
+                <Scissors size={16} /> Cut
+              </button>
+              <button onClick={() => act('copy')}>
+                <Copy size={16} /> Copy
+              </button>
+              <button onClick={() => act('duplicate')}>
+                <CopyPlus size={16} /> Duplicate
+              </button>
+              <button onClick={() => act('delete')}>
+                <Trash2 size={16} /> Delete
+              </button>
+              <button
+                onClick={() => {
+                  const picked = surf.current?.getSelectedStrokes() ?? [];
+                  if (picked.length && currentPage) setConvertTarget({ page: currentPage, strokes: picked });
+                }}
+              >
+                <Type size={16} /> Convert to Text
+              </button>
+            </div>
+          )}
+        </>
+      ) : (
         <div
-          className="page-lock-overlay"
-          style={{
-            position: 'absolute',
-            inset: 0,
-            background: 'rgba(15, 15, 18, 0.92)',
-            backdropFilter: 'blur(10px)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 12,
-            zIndex: 15,
+          className="continuous-scroll-pane"
+          ref={scrollWrapRef}
+          onScroll={(e) => {
+            const wrap = e.currentTarget;
+            const centerY = wrap.scrollTop + wrap.clientHeight * 0.35;
+            const cards = wrap.querySelectorAll<HTMLElement>('.continuous-page-card');
+            for (const c of cards) {
+              const top = c.offsetTop;
+              const bottom = top + c.offsetHeight;
+              if (centerY >= top && centerY <= bottom) {
+                const pid = c.dataset.pageId;
+                if (pid && pid !== pane?.pageId) {
+                  actions.setPage(index, pid);
+                }
+                break;
+              }
+            }
           }}
         >
-          <Lock size={36} color="#1E88FF" />
-          <h3 style={{ margin: 0, fontSize: 18 }}>Page {idx + 1} is Password Protected</h3>
-          <p style={{ margin: 0, fontSize: 13, color: 'var(--muted)' }}>
-            Enter this page’s password to view and edit its notes.
-          </p>
-          <button type="button" className="nn-create" onClick={() => onRequestUnlockPage(currentPage)}>
-            Unlock Page
-          </button>
+          <div className="continuous-pages-stack">
+            {pages.map((pg, pageIdx) => {
+              // Bounded canvas virtualization: mount active page ± 2 neighbors (minimum 5 pages) so long notebooks stay light
+              const shouldMountCanvas = Math.abs(pageIdx - Math.max(0, idx)) <= 2;
+              return (
+                <div key={pg.id} className="continuous-page-block">
+                  <div className="continuous-page-header">
+                    <span className="continuous-page-badge">
+                      Page {pageIdx + 1} of {pages.length}
+                    </span>
+                  </div>
+                  <ContinuousPageCard
+                    paneIndex={index}
+                    page={pg}
+                    pageIndex={pageIdx}
+                    isActivePage={pg.id === pane?.pageId}
+                    shouldMountCanvas={shouldMountCanvas}
+                    sharedRulerRef={sharedRulerRef}
+                    onRulerSync={syncRulerSurfaces}
+                    onRequestUnlockPage={onRequestUnlockPage}
+                    onSelectStrokesForConvert={(p, strokes) => setConvertTarget({ page: p, strokes })}
+                    onOpenTapBox={(p, pt) => setTapBox({ pageId: p.id, x: pt.x, y: pt.y, text: '' })}
+                    onAnyStrokeStart={() => {
+                      swipeCtrlRef.current.cancel();
+                      setSwipeSnap(swipeCtrlRef.current.getSnapshot());
+                    }}
+                  />
+                  {pageIdx < pages.length - 1 && (
+                    <div className="page-boundary-bar" role="group" aria-label={`After page ${pageIdx + 1}`}>
+                      <span className="page-boundary-line" />
+                      <button
+                        type="button"
+                        className="page-boundary-add-btn"
+                        aria-label={`Add page below page ${pageIdx + 1}`}
+                        title={`Add page below page ${pageIdx + 1}`}
+                        onClick={() => void handleAddPageAfterAndScroll(pg.id)}
+                      >
+                        <Plus size={14} /> <span>Add page below</span>
+                      </button>
+                      <span className="page-boundary-line" />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Deliberate Bottom Swipe-to-Add-Page Affordance + Accessible Add Page Button */}
+            <div className="bottom-add-page-zone">
+              <div
+                className={`swipe-add-affordance ${swipeSnap.state}`}
+                role="region"
+                aria-label="Swipe up to add a page"
+                style={{
+                  transform:
+                    swipeSnap.state === 'dragging' || swipeSnap.state === 'armed'
+                      ? `translateY(${-Math.round(swipeSnap.pullPx * 0.35)}px)`
+                      : undefined,
+                }}
+                onPointerDown={(e) => {
+                  const snap = swipeCtrlRef.current.start({
+                    pointerId: e.pointerId,
+                    pointerType: e.pointerType,
+                    clientY: e.clientY,
+                    timeStamp: e.timeStamp,
+                    activeTouchCount: 1,
+                    penDown: false,
+                    rulerDragging: false,
+                  });
+                  setSwipeSnap(snap);
+                  if (snap.state === 'dragging') {
+                    try {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                    } catch {
+                      /* ignore */
+                    }
+                  }
+                }}
+                onPointerMove={(e) => {
+                  const snap = swipeCtrlRef.current.move(e.pointerId, e.clientY, {
+                    activeTouchCount: 1,
+                    penDown: e.pointerType === 'pen',
+                    rulerDragging: false,
+                  });
+                  setSwipeSnap(snap);
+                }}
+                onPointerUp={(e) => {
+                  const res = swipeCtrlRef.current.end(e.pointerId, e.timeStamp);
+                  setSwipeSnap(res.snapshot);
+                  if (res.shouldAddPage) {
+                    const lastId = pages[pages.length - 1]?.id;
+                    void handleAddPageAfterAndScroll(lastId);
+                  }
+                }}
+                onPointerCancel={() => {
+                  const snap = swipeCtrlRef.current.cancel();
+                  setSwipeSnap(snap);
+                }}
+              >
+                <div className="swipe-add-pill">
+                  <span className={`swipe-add-icon ${swipeSnap.state === 'armed' ? 'armed' : ''}`}>
+                    <ArrowUp size={16} />
+                  </span>
+                  <span className="swipe-add-label">{swipeSnap.label}</span>
+                  <div className="swipe-add-progress-track" aria-hidden="true">
+                    <div
+                      className="swipe-add-progress-fill"
+                      style={{ width: `${Math.round(swipeSnap.progress * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                className="bottom-explicit-add-btn"
+                aria-label="Add page at end of notebook"
+                onClick={() => void handleAddPageAfterAndScroll(pages[pages.length - 1]?.id)}
+              >
+                <Plus size={16} /> <span>Add page</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
-      {tapBox && currentPage && (
+      {tapBox && (
         <div
           className="popover"
           style={{
@@ -567,41 +1015,11 @@ function Pane({
         </div>
       )}
 
-      {sel && kind === 'lasso' && (
-        <div
-          className="sel-menu"
-          role="toolbar"
-          aria-label="Selection actions"
-          style={{ left: Math.max(8, sel.rect.x + sel.rect.w / 2), top: Math.max(8, sel.rect.y - 56) }}
-        >
-          <button onClick={() => act('cut')}>
-            <Scissors size={16} /> Cut
-          </button>
-          <button onClick={() => act('copy')}>
-            <Copy size={16} /> Copy
-          </button>
-          <button onClick={() => act('duplicate')}>
-            <CopyPlus size={16} /> Duplicate
-          </button>
-          <button onClick={() => act('delete')}>
-            <Trash2 size={16} /> Delete
-          </button>
-          <button
-            onClick={() => {
-              const picked = surf.current?.getSelectedStrokes() ?? [];
-              if (picked.length) setConvertStrokes(picked);
-            }}
-          >
-            <Type size={16} /> Convert to Text
-          </button>
-        </div>
-      )}
-
-      {convertStrokes && currentPage && (
+      {convertTarget && (
         <ConvertToTextModal
-          page={currentPage}
-          strokes={convertStrokes}
-          onClose={() => setConvertStrokes(null)}
+          page={convertTarget.page}
+          strokes={convertTarget.strokes}
+          onClose={() => setConvertTarget(null)}
           onConverted={() => surf.current?.clearSelection()}
         />
       )}
@@ -611,7 +1029,7 @@ function Pane({
           className="icon sm"
           disabled={idx <= 0}
           aria-label="Previous page"
-          onClick={() => actions.setPage(index, pages[idx - 1].id)}
+          onClick={() => scrollToAndActivatePage(pages[idx - 1].id)}
         >
           ‹
         </button>
@@ -622,11 +1040,16 @@ function Pane({
           className="icon sm"
           disabled={idx >= pages.length - 1}
           aria-label="Next page"
-          onClick={() => actions.setPage(index, pages[idx + 1].id)}
+          onClick={() => scrollToAndActivatePage(pages[idx + 1].id)}
         >
           ›
         </button>
-        <button className="icon sm" aria-label="Add page" onClick={() => void actions.addPage(index)}>
+        <button
+          className="icon sm"
+          aria-label="Add page below current page"
+          title="Add page below current page"
+          onClick={() => void handleAddPageAfterAndScroll(currentPage?.id)}
+        >
           <Plus size={16} />
         </button>
         {hasClip && (
@@ -644,6 +1067,7 @@ function Pane({
           className={`icon sm ${rulerVisible ? 'on' : ''}`}
           aria-label="Toggle ruler"
           aria-pressed={rulerVisible}
+          title="Toggle straightedge ruler (0–14 cm)"
           onClick={() => actions.setTool({ rulerVisible: !rulerVisible })}
         >
           <Ruler size={18} />
@@ -960,7 +1384,55 @@ export function Editor() {
       </header>
 
       {pop === 'more' && (
-        <div className="popover more-menu" role="menu" style={{ minWidth: 270 }}>
+        <div className="popover more-menu" role="menu" style={{ minWidth: 286 }}>
+          <div className="row" style={{ fontSize: 12, color: 'var(--muted)', paddingBottom: 2 }}>
+            Page View
+          </div>
+          <div className="seg tabs2" role="radiogroup" aria-label="Page View" style={{ margin: '0 8px 8px' }}>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={s.pageViewMode === 'single'}
+              className={s.pageViewMode === 'single' ? 'on' : ''}
+              onClick={() => actions.setPageViewMode('single')}
+            >
+              Single Page
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={s.pageViewMode === 'continuous'}
+              className={s.pageViewMode === 'continuous' ? 'on' : ''}
+              onClick={() => actions.setPageViewMode('continuous')}
+            >
+              Continuous Scroll
+            </button>
+          </div>
+
+          <div className="row" style={{ fontSize: 12, color: 'var(--muted)', paddingBottom: 2 }}>
+            Ruler Units
+          </div>
+          <div className="seg tabs2" role="radiogroup" aria-label="Ruler Units" style={{ margin: '0 8px 8px' }}>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={(T.rulerUnits ?? 'metric') === 'metric'}
+              className={(T.rulerUnits ?? 'metric') === 'metric' ? 'on' : ''}
+              onClick={() => actions.setTool({ rulerUnits: 'metric' })}
+            >
+              Metric (cm)
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={T.rulerUnits === 'imperial'}
+              className={T.rulerUnits === 'imperial' ? 'on' : ''}
+              onClick={() => actions.setTool({ rulerUnits: 'imperial' })}
+            >
+              Inches (in)
+            </button>
+          </div>
+
           <div className="row">Paper colour</div>
           <div className="swatches">
             {PAPER_COLORS.map((c) => (
@@ -1275,6 +1747,14 @@ export function Editor() {
                         onClick={() => void actions.movePage(s.activePane, p.id, 1)}
                       >
                         <ArrowDown size={14} />
+                      </button>
+                      <button
+                        className="icon xs"
+                        aria-label="Add page below"
+                        title="Add page below"
+                        onClick={() => void actions.addPageAfter(s.activePane, p.id)}
+                      >
+                        <Plus size={14} />
                       </button>
                       <button
                         className="icon xs"
