@@ -5,7 +5,7 @@ import Dexie from 'dexie';
 
 Dexie.dependencies.indexedDB = indexedDB;
 Dexie.dependencies.IDBKeyRange = IDBKeyRange;
-import { clientToDoc, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
+import { clientToDoc, constrainView, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
 import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, UpdateImageBoxCommand, deserializeCommand, type StrokeTarget } from '../src/domain/history';
 import { isDrawingOrManipulationTool, isAllowedTextSelectionTarget } from '../src/engine/selectionGuard';
 import type { ImageBox } from '../src/domain/types';
@@ -780,6 +780,42 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
 
     const rangeInput = { nodeType: 1, tagName: 'INPUT', type: 'range' } as unknown as Node;
     expect(isAllowedTextSelectionTarget(rangeInput)).toBe(false);
+  });
+
+  describe('constrainView pan and zoom boundaries', () => {
+    it('centers axis when page fits within viewport minus gutters', () => {
+      // view: 800x600, page: 500x400, scale: 1, gutter: 16
+      // S = 500 <= 800 - 32 = 768 -> centered tx = (800 - 500) / 2 = 150
+      // S = 400 <= 600 - 32 = 568 -> centered ty = (600 - 400) / 2 = 100
+      const v = constrainView({ scale: 1, tx: 9999, ty: -9999 }, 800, 600, 500, 400, 16);
+      expect(v.scale).toBe(1);
+      expect(v.tx).toBe(150);
+      expect(v.ty).toBe(100);
+    });
+
+    it('clamps translation when zoomed page exceeds viewport', () => {
+      // view: 800x600, page: 600x800, scale: 2 (sw = 1200, sh = 1600), gutter: 16
+      // minTx = 800 - 16 - 1200 = -416, maxTx = 16
+      // minTy = 600 - 16 - 1600 = -1016, maxTy = 16
+      const vOver = constrainView({ scale: 2, tx: 500, ty: 500 }, 800, 600, 600, 800, 16);
+      expect(vOver.tx).toBe(16);
+      expect(vOver.ty).toBe(16);
+
+      const vUnder = constrainView({ scale: 2, tx: -2000, ty: -2000 }, 800, 600, 600, 800, 16);
+      expect(vUnder.tx).toBe(-416);
+      expect(vUnder.ty).toBe(-1016);
+
+      const vWithin = constrainView({ scale: 2, tx: -100, ty: -200 }, 800, 600, 600, 800, 16);
+      expect(vWithin.tx).toBe(-100);
+      expect(vWithin.ty).toBe(-200);
+    });
+
+    it('safely handles non-finite or invalid scales without crashing', () => {
+      const v = constrainView({ scale: NaN, tx: 0, ty: 0 }, 800, 600, 500, 400, 16);
+      expect(v.scale).toBe(1);
+      expect(Number.isFinite(v.tx)).toBe(true);
+      expect(Number.isFinite(v.ty)).toBe(true);
+    });
   });
 });
 

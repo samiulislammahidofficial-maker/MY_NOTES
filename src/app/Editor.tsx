@@ -1132,7 +1132,19 @@ function Pane({
         >
           +
         </button>
-        <button className="icon sm" aria-label="Fit page width" title="Fit page width" onClick={() => surf.current?.fit()}>
+        <button
+          className="icon sm"
+          aria-label="Fit page width / Reset View"
+          title="Fit page width / Reset View"
+          onClick={() => {
+            if (pageViewMode === 'continuous' && scrollWrapRef.current) {
+              const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
+              activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+              surf.current?.fit();
+            }
+          }}
+        >
           <Maximize size={18} />
         </button>
       </div>

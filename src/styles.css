@@ -977,16 +977,17 @@ button:disabled { opacity: .35; cursor: default; }
   inset: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 20px clamp(12px, 3.5vw, 48px) 96px;
+  padding: 16px clamp(12px, 2.5vw, 24px) 96px;
   scroll-behavior: smooth;
   overscroll-behavior-y: contain;
 }
 .continuous-pages-stack {
-  max-width: 780px;
+  width: 100%;
+  max-width: 1000px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 .continuous-page-block {
   display: flex;

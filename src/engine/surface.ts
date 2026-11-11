@@ -1,6 +1,6 @@
 import type { ImageBox, InkStroke, Page, Template, TextBox, ViewMatrix } from '../domain/types';
 import { SAMPLE_STRIDE, isDark } from '../domain/types';
-import { clientToDoc, fitPage, fitWidth, zoomAbout } from '../domain/geometry';
+import { clientToDoc, constrainView, fitPage, fitWidth, zoomAbout } from '../domain/geometry';
 import { SampleBuffer, StrokeStabilizer, arbitrate, expandEvents, resolvePressure } from './input';
 import { applyView, boundsOf, centerlinePath, createRainbowStyle, strokePath } from './render';
 import {
@@ -84,7 +84,15 @@ export class InkSurface {
   private sceneDirty = true;
   private liveDirty = false;
 
-  // input state
+  // diagnostics counters (in-memory only, no private text or telemetry)
+  private debugCounters = {
+    down: 0,
+    up: 0,
+    cancel: 0,
+    accepted: 0,
+    completed: 0,
+    lastGapMs: 0,
+  };
   private touches = new Map<number, { x: number; y: number }>();
   private activeId: number | null = null;
   private activeType = '';
@@ -153,7 +161,7 @@ export class InkSurface {
     this.live.addEventListener('pointermove', this.onMove);
     this.live.addEventListener('pointerup', this.onUp);
     this.live.addEventListener('pointercancel', this.onCancel);
-    this.live.addEventListener('lostpointercapture', this.onCancel);
+    this.live.addEventListener('lostpointercapture', this.onLostPointerCapture);
     this.live.addEventListener('wheel', this.onWheel, { passive: false });
     this.live.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('mynotes:quiesce-for-update', this.onQuiesceForUpdate);
@@ -234,6 +242,7 @@ export class InkSurface {
       p95Ms: a.length ? a[Math.floor(a.length * 0.95)] : 0,
       dpr: this.dpr,
       strokes: this.strokes.length,
+      debug: { ...this.debugCounters },
     };
   }
 
@@ -288,12 +297,19 @@ export class InkSurface {
     this.invalidate();
   }
   setView(v: ViewMatrix) {
-    this.view = v;
+    this.view = this.applyBounds(v);
     this.opts.onViewChange?.(this.view);
     this.invalidate();
   }
   isStrokeActive() {
     return this.activeId !== null || this.penDown;
+  }
+
+  private applyBounds(v: ViewMatrix): ViewMatrix {
+    if (this.opts.fitFullHost || this.opts.disableAutoFit || !this.page || this.cssW <= 8) {
+      return v;
+    }
+    return constrainView(v, this.cssW, this.cssH, this.page.width, this.page.height, 16);
   }
 
   fitWidthView() {
@@ -302,7 +318,7 @@ export class InkSurface {
       const scale = this.cssW / Math.max(1, this.page.width);
       this.view = { scale, tx: 0, ty: 0 };
     } else {
-      this.view = fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16);
+      this.view = this.applyBounds(fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16));
     }
     this.opts.onViewChange?.(this.view);
     this.invalidate();
@@ -314,7 +330,7 @@ export class InkSurface {
       const scale = this.cssW / Math.max(1, this.page.width);
       this.view = { scale, tx: 0, ty: 0 };
     } else {
-      this.view = fitPage(this.cssW, this.cssH, this.page.width, this.page.height);
+      this.view = this.applyBounds(fitPage(this.cssW, this.cssH, this.page.width, this.page.height));
     }
     this.opts.onViewChange?.(this.view);
     this.invalidate();
@@ -322,7 +338,7 @@ export class InkSurface {
 
   zoomByFactor(factor: number) {
     const targetScale = this.view.scale * factor;
-    this.view = zoomAbout(this.view, this.cssW / 2, this.cssH / 2, targetScale);
+    this.view = this.applyBounds(zoomAbout(this.view, this.cssW / 2, this.cssH / 2, targetScale));
     this.opts.onViewChange?.(this.view);
     this.invalidate();
   }
@@ -360,7 +376,11 @@ export class InkSurface {
         const scale = this.cssW / Math.max(1, this.page.width);
         this.view = { scale, tx: 0, ty: 0 };
       } else {
-        this.view = { ...this.view, tx: this.view.tx + (this.cssW - oldW) / 2, ty: this.view.ty + (this.cssH - oldH) / 2 };
+        this.view = this.applyBounds({
+          ...this.view,
+          tx: this.view.tx + (this.cssW - oldW) / 2,
+          ty: this.view.ty + (this.cssH - oldH) / 2,
+        });
       }
     }
     this.maybeFit();
@@ -970,6 +990,13 @@ export class InkSurface {
   private onDown = (e: PointerEvent) => {
     this.opts.onActivate?.();
     if (e.pointerType === 'touch') this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    this.debugCounters.down++;
+    if (e.pointerType === 'pen') {
+      const now = performance.now();
+      if (this.lastPenUp > 0) {
+        this.debugCounters.lastGapMs = Math.round(now - this.lastPenUp);
+      }
+    }
     const tool = this.opts.getTool();
     const mode = this.modeFor(tool);
     const d = this.doc(e);
@@ -1131,6 +1158,7 @@ export class InkSurface {
     this.activeType = e.pointerType;
     this.activeSessionToken = ++this.sessionCounter;
     this.mode = mode;
+    this.debugCounters.accepted++;
     if (e.pointerType === 'pen') this.penDown = true;
     this.opts.onStrokeStart?.();
     if (mode !== 'lasso' && this.sel) this.clearSelection();
@@ -1365,7 +1393,11 @@ export class InkSurface {
         break;
       case 'pan':
         if (this.panLast) {
-          this.view = { ...this.view, tx: this.view.tx + e.clientX - this.panLast.x, ty: this.view.ty + e.clientY - this.panLast.y };
+          this.view = this.applyBounds({
+            ...this.view,
+            tx: this.view.tx + e.clientX - this.panLast.x,
+            ty: this.view.ty + e.clientY - this.panLast.y,
+          });
           this.panLast = { x: e.clientX, y: e.clientY };
           this.invalidate();
         }
@@ -1396,6 +1428,7 @@ export class InkSurface {
 
   private onUp = (e: PointerEvent) => {
     this.touches.delete(e.pointerId);
+    this.debugCounters.up++;
     if (this.touches.size < 2) {
       this.navLast = null;
       this.rulerTwoFinger = null;
@@ -1405,6 +1438,7 @@ export class InkSurface {
       this.lastPenUp = performance.now();
     }
     if (e.pointerId !== this.activeId || this.activeSessionToken <= 0) return;
+    this.debugCounters.completed++;
     const mode = this.mode;
     this.activeId = null;
     this.activeSessionToken = 0;
@@ -1451,6 +1485,7 @@ export class InkSurface {
 
   private onCancel = (e: PointerEvent) => {
     this.touches.delete(e.pointerId);
+    this.debugCounters.cancel++;
     if (this.touches.size < 2) {
       this.navLast = null;
       this.rulerTwoFinger = null;
@@ -1459,7 +1494,18 @@ export class InkSurface {
       this.penDown = false;
       this.lastPenUp = performance.now();
     }
-    if (e.pointerId === this.activeId) this.cancelSession();
+    // Only cancel the session if the event belongs to the current active pointer
+    if (e.pointerId === this.activeId) {
+      this.cancelSession();
+    }
+  };
+
+  private onLostPointerCapture = (e: PointerEvent) => {
+    // Normal capture release when pointer is already finalized/cleared is ignored.
+    // Only cancel if this capture loss actually belongs to an in-progress active session.
+    if (e.pointerId === this.activeId && this.activeSessionToken > 0) {
+      this.onCancel(e);
+    }
   };
 
   /** Discard an incomplete gesture; committed content is preserved. */

@@ -46,6 +46,46 @@ export function fitPage(
 }
 
 /**
+ * Constrains translation and scale to ensure the page remains recoverable and cannot float offscreen.
+ * Specifications:
+ * - V = available viewport dimension, S = document dimension * view scale, g = gutter.
+ * - If S <= V - 2g: center that axis with translation t = (V - S) / 2; disable unnecessary pan along that axis.
+ * - If S > V - 2g: clamp translation to [V - g - S, g].
+ */
+export function constrainView(
+  v: ViewMatrix,
+  viewW: number,
+  viewH: number,
+  pageW: number,
+  pageH: number,
+  gutter = 16,
+): ViewMatrix {
+  const scale = Number.isFinite(v.scale) && v.scale > 0 ? clampScale(v.scale) : 1;
+  const sw = pageW * scale;
+  const sh = pageH * scale;
+
+  let tx: number;
+  if (sw <= viewW - 2 * gutter) {
+    tx = (viewW - sw) / 2;
+  } else {
+    const minTx = viewW - gutter - sw;
+    const maxTx = gutter;
+    tx = Math.max(minTx, Math.min(maxTx, v.tx));
+  }
+
+  let ty: number;
+  if (sh <= viewH - 2 * gutter) {
+    ty = (viewH - sh) / 2;
+  } else {
+    const minTy = viewH - gutter - sh;
+    const maxTy = gutter;
+    ty = Math.max(minTy, Math.min(maxTy, v.ty));
+  }
+
+  return { scale, tx, ty };
+}
+
+/**
  * Default Fit Width view matrix: scales the page to fill the pane width with a modest gutter
  * and positions the top of the page near the top of the pane for natural vertical writing.
  */
