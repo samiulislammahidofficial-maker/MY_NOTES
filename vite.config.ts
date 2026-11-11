@@ -46,7 +46,7 @@ export default defineConfig({
       },
     },
     VitePWA({
-      registerType: 'autoUpdate',
+      registerType: 'prompt',
       includeAssets: ['icons/icon-512.svg', 'tutorial/poster.png', 'tutorial/captions.en.vtt', 'tutorial/captions.bn.vtt'],
       manifest: {
         name: 'My Notes',
@@ -67,9 +67,11 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Keep the tutorial MP4 out of critical app-shell precache; users download it explicitly via Cache Storage
-        globIgnores: ['**/tutorial/*.mp4'],
-        maximumFileSizeToCacheInBytes: 30 * 1024 * 1024,
+        // Keep the tutorial MP4 AND the 21.6 MB ONNX Runtime WASM out of critical first-visit precache!
+        // Include pdf.worker.min.mjs in precache so offline PDF import/rendering works 100% offline.
+        globPatterns: ['**/*.{js,mjs,css,html,ico,png,svg,vtt,webmanifest}'],
+        globIgnores: ['**/tutorial/*.mp4', '**/ort-wasm*.wasm', '**/trocrWorker*.js'],
+        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         runtimeCaching: [
           {
             urlPattern: /\/tutorial\/.*\.(mp4|vtt|png)$/,
@@ -79,9 +81,27 @@ export default defineConfig({
               rangeRequests: true,
             },
           },
+          {
+            urlPattern: /\/assets\/(ort-wasm.*|trocrWorker.*)\.(wasm|js)$/,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'my-notes-htr-runtime-v1',
+            },
+          },
         ],
       },
     }),
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('pdfjs-dist')) return 'pdfjs';
+          if (id.includes('pdf-lib') || id.includes('@pdf-lib/fontkit')) return 'pdflib';
+          if (id.includes('katex')) return 'katex';
+        },
+      },
+    },
+  },
   test: { environment: 'node', include: ['tests/**/*.test.ts'] },
 });

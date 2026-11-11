@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "size-report": "node scripts/measure-app-size.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.1.2",

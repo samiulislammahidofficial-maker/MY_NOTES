@@ -179,16 +179,37 @@ function history(nbId: string) {
   return h;
 }
 
-function track(p: Promise<void>) {
+const dirtyPages = new Set<string>();
+const pendingPromises = new Set<Promise<void>>();
+const syncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('mynotes-sync-v1') : null;
+
+export const hasPendingWrites = () => pending > 0 || dirtyPages.size > 0;
+export const flushPendingWrites = async () => {
+  if (pendingPromises.size > 0) {
+    await Promise.allSettled([...pendingPromises]);
+  }
+  if (dirtyPages.size > 0) {
+    await actions.retryFailedSaves();
+  }
+};
+
+function track(op: () => Promise<void>, pageId?: string, nbId?: string) {
   pending++;
   set({ save: 'saving', saveError: null });
+  const p = op();
+  pendingPromises.add(p);
   p.then(
     () => {
+      pendingPromises.delete(p);
       pending--;
-      if (pending === 0 && get().save !== 'failed') set({ save: 'saved' });
+      if (pageId) dirtyPages.delete(pageId);
+      if (nbId) syncChannel?.postMessage({ type: 'notebook-updated', notebookId: nbId, pageId });
+      if (pending === 0 && dirtyPages.size === 0 && get().save !== 'failed') set({ save: 'saved' });
     },
     (err: unknown) => {
+      pendingPromises.delete(p);
       pending--;
+      if (pageId) dirtyPages.add(pageId);
       // keep dirty state in memory; report truthfully
       set({ save: 'failed', saveError: err instanceof Error ? err.message : 'Write failed' });
     },
@@ -232,9 +253,12 @@ const target: StrokeTarget = {
     const nb = pageNotebook.get(s.pageId)!;
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
     track(
-      persistEncryptedIfLocked(s.pageId, nb).then((handled) => {
-        if (!handled) return repo.addStroke(s, nb);
-      }),
+      () =>
+        persistEncryptedIfLocked(s.pageId, nb).then((handled) => {
+          if (!handled) return repo.addStroke(s, nb);
+        }),
+      s.pageId,
+      nb,
     );
   },
   replace(pageId, remove, add) {
@@ -243,9 +267,12 @@ const target: StrokeTarget = {
     const nb = pageNotebook.get(pageId)!;
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
     track(
-      persistEncryptedIfLocked(pageId, nb).then((handled) => {
-        if (!handled) return repo.replaceStrokes(remove.map((s) => s.id), add, nb);
-      }),
+      () =>
+        persistEncryptedIfLocked(pageId, nb).then((handled) => {
+          if (!handled) return repo.replaceStrokes(remove.map((s) => s.id), add, nb);
+        }),
+      pageId,
+      nb,
     );
   },
   removeStroke(pageId, id) {
@@ -253,9 +280,12 @@ const target: StrokeTarget = {
     const nb = pageNotebook.get(pageId)!;
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
     track(
-      persistEncryptedIfLocked(pageId, nb).then((handled) => {
-        if (!handled) return repo.removeStroke(id, nb);
-      }),
+      () =>
+        persistEncryptedIfLocked(pageId, nb).then((handled) => {
+          if (!handled) return repo.removeStroke(id, nb);
+        }),
+      pageId,
+      nb,
     );
   },
   addText(tb) {
@@ -264,9 +294,12 @@ const target: StrokeTarget = {
     const nb = pageNotebook.get(tb.pageId)!;
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
     track(
-      persistEncryptedIfLocked(tb.pageId, nb).then((handled) => {
-        if (!handled) return repo.putText(tb, nb);
-      }),
+      () =>
+        persistEncryptedIfLocked(tb.pageId, nb).then((handled) => {
+          if (!handled) return repo.putText(tb, nb);
+        }),
+      tb.pageId,
+      nb,
     );
   },
   removeText(pageId, id) {
@@ -274,9 +307,12 @@ const target: StrokeTarget = {
     const nb = pageNotebook.get(pageId)!;
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
     track(
-      persistEncryptedIfLocked(pageId, nb).then((handled) => {
-        if (!handled) return repo.deleteText(id, nb);
-      }),
+      () =>
+        persistEncryptedIfLocked(pageId, nb).then((handled) => {
+          if (!handled) return repo.deleteText(id, nb);
+        }),
+      pageId,
+      nb,
     );
   },
   insertPage(notebookId, page, layer, afterPageId) {
@@ -317,10 +353,12 @@ const target: StrokeTarget = {
     });
 
     track(
-      (async () => {
+      async () => {
         await repo.createNotebook(updatedNb, page, layer);
         await persistEncryptedIfLocked(page.id, notebookId);
-      })(),
+      },
+      page.id,
+      notebookId,
     );
   },
   removeAddedPage(notebookId, pageId, fallbackPageId) {
@@ -347,12 +385,14 @@ const target: StrokeTarget = {
       layerVersion: st.layerVersion + 1,
     });
     track(
-      (async () => {
+      async () => {
         await repo.updateNotebook(updatedNb);
         if (updatedNb.passwordLock && getSessionPassword(notebookId)) {
           await persistEncryptedIfLocked(fallback, notebookId);
         }
-      })(),
+      },
+      fallback,
+      notebookId,
     );
   },
 };
@@ -383,6 +423,27 @@ export const actions = {
     }
     const customFonts = await loadSavedCustomFonts().catch(() => []);
     set({ notebooks: await repo.allNotebooks(), customFonts, ready: true });
+
+    if (syncChannel) {
+      syncChannel.onmessage = async (ev) => {
+        const msg = ev.data as { type?: string; notebookId?: string; pageId?: string };
+        if (msg?.type === 'notebook-updated' && msg.notebookId) {
+          // Do not overwrite a page that currently has unsaved dirty writes in this tab
+          if (msg.pageId && dirtyPages.has(msg.pageId)) return;
+          const all = await repo.allNotebooks();
+          set({ notebooks: all });
+          if (get().tabs.includes(msg.notebookId)) {
+            if (msg.pageId) {
+              strokesByPage.delete(msg.pageId);
+              textsByPage.delete(msg.pageId);
+            }
+            await actions.loadNotebook(msg.notebookId);
+            set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
+          }
+        }
+      };
+    }
+
     try {
       if (navigator.storage?.persist) {
         const already = (await navigator.storage.persisted?.()) ?? false;
@@ -390,6 +451,29 @@ export const actions = {
       }
     } catch {
       set({ persisted: false });
+    }
+  },
+
+  async retryFailedSaves() {
+    if (dirtyPages.size === 0 && get().save !== 'failed') return;
+    set({ save: 'saving', saveError: null });
+    try {
+      for (const pageId of [...dirtyPages]) {
+        const nbId = pageNotebook.get(pageId);
+        if (!nbId) continue;
+        const handled = await persistEncryptedIfLocked(pageId, nbId);
+        if (!handled) {
+          const strokes = getStrokes(pageId);
+          await repo.replaceStrokes(strokes.map((s) => s.id), strokes, nbId);
+          for (const tb of getTexts(pageId)) {
+            await repo.putText(tb, nbId);
+          }
+        }
+        dirtyPages.delete(pageId);
+      }
+      set({ save: 'saved', saveError: null });
+    } catch (err: unknown) {
+      set({ save: 'failed', saveError: err instanceof Error ? err.message : 'Retry failed' });
     }
   },
 
@@ -814,7 +898,7 @@ export const actions = {
     layersByPage.set(pageId, list);
     set((s) => ({ layerVersion: s.layerVersion + 1, strokeVersion: s.strokeVersion + 1 }));
     const l = list.find((x) => x.id === id);
-    if (l) track(repo.putLayer(l));
+    if (l) track(() => repo.putLayer(l), pageId);
   },
   async addLayer(pageId: string) {
     const list = getLayers(pageId);
@@ -854,7 +938,7 @@ export const actions = {
     pagesByNotebook.set(nbId, pages);
     set((s) => ({ layerVersion: s.layerVersion + 1, strokeVersion: s.strokeVersion + 1 }));
     const page = pages.find((p) => p.id === pageId)!;
-    track(repo.saveLayers(page, list));
+    track(() => repo.saveLayers(page, list), pageId, nbId);
   },
 
   async addPage(pane: number): Promise<string | null> {

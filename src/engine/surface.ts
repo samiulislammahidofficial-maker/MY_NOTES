@@ -3,7 +3,6 @@ import { SAMPLE_STRIDE, isDark } from '../domain/types';
 import { clientToDoc, fitPage, zoomAbout } from '../domain/geometry';
 import { SampleBuffer, arbitrate, expandEvents, resolvePressure } from './input';
 import { applyView, boundsOf, centerlinePath, createRainbowStyle, strokePath } from './render';
-import { getScannedImageElement, renderPdfPageBackground } from '../pdf/pdfManager';
 import {
   type Pt,
   bboxIntersectsPolygonBounds,
@@ -184,19 +183,25 @@ export class InkSurface {
     this.bgPageKey = key;
     this.bgCanvas = null;
     if (page.pdfAssetId && page.pdfPageIndex) {
-      renderPdfPageBackground(page.pdfAssetId, page.pdfPageIndex, 1.5).then((bmp) => {
-        if (this.bgPageKey === key && bmp) {
-          this.bgCanvas = bmp;
-          this.invalidate();
-        }
-      }).catch(() => {});
+      import('../pdf/pdfManager')
+        .then(({ renderPdfPageBackground }) => renderPdfPageBackground(page.pdfAssetId!, page.pdfPageIndex!, 1.5))
+        .then((bmp) => {
+          if (this.bgPageKey === key && bmp) {
+            this.bgCanvas = bmp;
+            this.invalidate();
+          }
+        })
+        .catch(() => {});
     } else if (page.imageAssetId) {
-      getScannedImageElement(page.imageAssetId).then((img) => {
-        if (this.bgPageKey === key && img) {
-          this.bgCanvas = img;
-          this.invalidate();
-        }
-      }).catch(() => {});
+      import('../pdf/pdfManager')
+        .then(({ getScannedImageElement }) => getScannedImageElement(page.imageAssetId!))
+        .then((img) => {
+          if (this.bgPageKey === key && img) {
+            this.bgCanvas = img;
+            this.invalidate();
+          }
+        })
+        .catch(() => {});
     }
   }
   setStrokes(strokes: InkStroke[]) {
@@ -332,7 +337,7 @@ export class InkSurface {
       ctx.lineJoin = 'round';
       const w = Math.max(1.5, s.width);
       ctx.setLineDash(s.strokeStyle === 'dashed' ? [w * 3, w * 2.2] : [w * 0.2, w * 2.2]);
-      ctx.stroke(centerlinePath(s.samples));
+      ctx.stroke(centerlinePath(s.samples, s.id, s.revision));
       ctx.setLineDash([]);
     } else {
       ctx.fillStyle = style;

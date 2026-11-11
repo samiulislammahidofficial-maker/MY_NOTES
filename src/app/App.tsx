@@ -6,6 +6,7 @@ import { Library } from './Library';
 import { Editor } from './Editor';
 import { Welcome } from './Welcome';
 import { Opening } from './Opening';
+import { SafeUpdateBanner, restoreSafeUpdateSnapshotIfAny } from '../ui/SafeUpdateBanner';
 
 export default function App() {
   const ready = useApp((s) => s.ready);
@@ -15,13 +16,19 @@ export default function App() {
 
   useEffect(() => {
     setError(null);
-    actions.init().catch((e: unknown) => setError(e instanceof Error ? e.message : 'Storage failed to open'));
+    actions
+      .init()
+      .then(() => {
+        restoreSafeUpdateSnapshotIfAny();
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Storage failed to open'));
   }, [attempt]);
 
   return (
     <>
       {ready ? mode === 'welcome' ? <Welcome /> : mode === 'library' ? <Library /> : <Editor /> : null}
       <Opening ready={ready} error={error} onRetry={() => setAttempt((a) => a + 1)} />
+      <SafeUpdateBanner />
       <Analytics />
       <SpeedInsights />
     </>

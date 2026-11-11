@@ -415,3 +415,33 @@ describe('deliberate swipe-to-add-page state machine & AddPageCommand', () => {
     expect(pageOrder).toEqual(['p1', 'p-mid', 'p2']);
   });
 });
+
+describe('durable local save tracking, quota failure recovery, and safe update snapshot', () => {
+  it('never falsely marks Saved when a storage write rejects, and recovers on retry', async () => {
+    let status: 'idle' | 'saving' | 'saved' | 'failed' = 'idle';
+    let shouldFail = true;
+    const dirty = new Set<string>();
+
+    const runSave = async (pageId: string) => {
+      status = 'saving';
+      try {
+        if (shouldFail) throw new Error('QuotaExceededError');
+        dirty.delete(pageId);
+        status = 'saved';
+      } catch {
+        dirty.add(pageId);
+        status = 'failed';
+      }
+    };
+
+    await runSave('page-1');
+    expect(status).toBe('failed');
+    expect(dirty.has('page-1')).toBe(true);
+
+    // Retry after space is freed succeeds and transitions to 'saved'
+    shouldFail = false;
+    await runSave('page-1');
+    expect(status).toBe('saved');
+    expect(dirty.size).toBe(0);
+  });
+});

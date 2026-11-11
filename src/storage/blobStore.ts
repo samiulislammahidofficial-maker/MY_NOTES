@@ -44,18 +44,53 @@ export const blobStore = {
     const dir = await getOpfsDir();
     if (dir) {
       try {
-        const fh = await dir.getFileHandle(id, { create: true });
-        const w = await fh.createWritable();
+        const tmpName = `${id}.staging`;
+        const tmpFh = await dir.getFileHandle(tmpName, { create: true });
+        const w = await tmpFh.createWritable();
         await w.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
         await w.close();
-        const verify = await fh.getFile();
-        if (verify.size === bytes.byteLength) return 'opfs';
+        const verifyTmp = await tmpFh.getFile();
+        if (verifyTmp.size === bytes.byteLength) {
+          const fh = await dir.getFileHandle(id, { create: true });
+          const wf = await fh.createWritable();
+          await wf.write(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+          await wf.close();
+          await dir.removeEntry(tmpName).catch(() => {});
+          const verify = await fh.getFile();
+          if (verify.size === bytes.byteLength) return 'opfs';
+        }
       } catch {
         // Fall through to IndexedDB blob store
       }
     }
     await db.blobs.put({ id, data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer });
     return 'idb';
+  },
+
+  async sweepOrphans(referencedAssetIds: Set<string>): Promise<number> {
+    let removed = 0;
+    const dir = await getOpfsDir();
+    if (dir && 'keys' in dir) {
+      try {
+        for await (const k of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+          if (k === '.probe') continue;
+          if (k.endsWith('.staging') || !referencedAssetIds.has(k)) {
+            await dir.removeEntry(k).catch(() => {});
+            removed++;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const idbKeys = await db.blobs.toCollection().primaryKeys();
+    for (const k of idbKeys) {
+      if (!referencedAssetIds.has(String(k))) {
+        await db.blobs.delete(String(k)).catch(() => {});
+        removed++;
+      }
+    }
+    return removed;
   },
 
   async get(id: string): Promise<Uint8Array | null> {

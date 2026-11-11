@@ -2,11 +2,29 @@ import { getStroke } from 'perfect-freehand';
 import type { InkStroke, ViewMatrix } from '../domain/types';
 import { SAMPLE_STRIDE } from '../domain/types';
 
-type PathSrc = { samples: Float32Array; width: number; tool?: InkStroke['tool']; smoothing?: number };
+type PathSrc = {
+  id?: string;
+  revision?: number;
+  samples: Float32Array;
+  width: number;
+  tool?: InkStroke['tool'];
+  smoothing?: number;
+};
+
+const MAX_PATH_CACHE = 2000;
+const strokePathCache = new Map<string, Path2D>();
+const centerlinePathCache = new Map<string, Path2D>();
 
 /** Nib behaviour: ballpoint ~constant width; fountain = elliptical chisel; brush = strong pressure curve. */
 export function strokePath(s: PathSrc, complete = true): Path2D {
   const tool = s.tool ?? 'ballpoint';
+  const cacheKey =
+    complete && s.id
+      ? `${s.id}:${s.revision ?? 1}:${s.width}:${tool}:${s.smoothing ?? ''}:${s.samples.length}`
+      : null;
+  if (cacheKey && strokePathCache.has(cacheKey)) {
+    return strokePathCache.get(cacheKey)!;
+  }
   const n = s.samples.length / SAMPLE_STRIDE;
   const pts: number[][] = [];
   for (let i = 0; i < n; i++) {
@@ -44,11 +62,20 @@ export function strokePath(s: PathSrc, complete = true): Path2D {
   p.moveTo(outline[0][0], outline[0][1]);
   for (let i = 1; i < outline.length; i++) p.lineTo(outline[i][0], outline[i][1]);
   p.closePath();
+  if (cacheKey) {
+    if (strokePathCache.size >= MAX_PATH_CACHE) {
+      const oldest = strokePathCache.keys().next().value;
+      if (oldest) strokePathCache.delete(oldest);
+    }
+    strokePathCache.set(cacheKey, p);
+  }
   return p;
 }
 
 /** Build a center-line path for dashed or dotted strokes. */
-export function centerlinePath(samples: Float32Array): Path2D {
+export function centerlinePath(samples: Float32Array, strokeId?: string, revision?: number): Path2D {
+  const key = strokeId ? `${strokeId}:${revision ?? 1}:${samples.length}` : null;
+  if (key && centerlinePathCache.has(key)) return centerlinePathCache.get(key)!;
   const p = new Path2D();
   const n = samples.length / SAMPLE_STRIDE;
   if (!n) return p;
@@ -56,6 +83,13 @@ export function centerlinePath(samples: Float32Array): Path2D {
   for (let i = 1; i < n; i++) {
     const o = i * SAMPLE_STRIDE;
     p.lineTo(samples[o], samples[o + 1]);
+  }
+  if (key) {
+    if (centerlinePathCache.size >= MAX_PATH_CACHE) {
+      const oldest = centerlinePathCache.keys().next().value;
+      if (oldest) centerlinePathCache.delete(oldest);
+    }
+    centerlinePathCache.set(key, p);
   }
   return p;
 }

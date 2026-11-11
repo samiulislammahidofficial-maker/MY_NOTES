@@ -30,10 +30,11 @@ import { db, repo } from '../storage/db';
 import { blobStore } from '../storage/blobStore';
 import type { Notebook } from '../domain/types';
 import { NewNotebookDialog, templateStyle } from './NewNotebook';
-import { importPdfAsNotebook, importScannedImageAsNotebook } from '../pdf/pdfManager';
-import { buildBackupZipBytes, restoreFromBackupZipBytes, saveOrShareFileBytes } from '../export/backup';
 import { isDocumentUnlockedInSession } from '../security/passwordLock';
 import { PasswordModal, type PasswordModalMode } from '../ui/PasswordModal';
+
+const loadPdfManager = () => import('../pdf/pdfManager');
+const loadBackupManager = () => import('../export/backup');
 
 function age(t: number): string {
   const s = (Date.now() - t) / 1000;
@@ -145,10 +146,12 @@ export function Library() {
     setBusyMsg(`Importing ${file.name}…`);
     try {
       if (file.name.toLowerCase().endsWith('.zip')) {
+        const { restoreFromBackupZipBytes } = await loadBackupManager();
         const bytes = new Uint8Array(await file.arrayBuffer());
         await restoreFromBackupZipBytes(bytes);
         await actions.refreshNotebooksAndFonts();
       } else {
+        const { importPdfAsNotebook } = await loadPdfManager();
         const nbId = await importPdfAsNotebook(file);
         await actions.refreshNotebooksAndFonts();
         await actions.openNotebook(nbId);
@@ -166,6 +169,7 @@ export function Library() {
     if (!file) return;
     setBusyMsg(`Importing scan ${file.name}…`);
     try {
+      const { importScannedImageAsNotebook } = await loadPdfManager();
       const nbId = await importScannedImageAsNotebook(file);
       await actions.refreshNotebooksAndFonts();
       await actions.openNotebook(nbId);
@@ -180,6 +184,7 @@ export function Library() {
   const handleExportAllBackup = async () => {
     setBusyMsg('Creating full offline backup (.tabletnotes.zip)…');
     try {
+      const { buildBackupZipBytes, saveOrShareFileBytes } = await loadBackupManager();
       const bytes = await buildBackupZipBytes();
       await saveOrShareFileBytes(bytes, `MyNotes-Backup-${new Date().toISOString().slice(0, 10)}.tabletnotes.zip`, 'application/zip');
     } catch (err) {

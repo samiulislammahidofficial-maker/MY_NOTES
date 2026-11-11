@@ -59,10 +59,11 @@ import {
   recognizeWithGeminiOptIn,
 } from '../recognition/provider';
 import { segmentStrokesIntoLines } from '../recognition/segmentation';
-import { exportNotebookToPdfBytes } from '../pdf/pdfManager';
-import { buildBackupZipBytes, saveOrShareFileBytes } from '../export/backup';
 import { isDocumentUnlockedInSession } from '../security/passwordLock';
 import { PasswordModal, type PasswordModalMode } from '../ui/PasswordModal';
+
+const loadPdfManager = () => import('../pdf/pdfManager');
+const loadBackupManager = () => import('../export/backup');
 
 function ConvertToTextModal({
   page,
@@ -1303,6 +1304,10 @@ export function Editor() {
     setPop(null);
     setBusyMsg('Exporting vector PDF…');
     try {
+      const [{ exportNotebookToPdfBytes }, { saveOrShareFileBytes }] = await Promise.all([
+        loadPdfManager(),
+        loadBackupManager(),
+      ]);
       const bytes = await exportNotebookToPdfBytes(
         curNb,
         curPages,
@@ -1323,6 +1328,7 @@ export function Editor() {
     setPop(null);
     setBusyMsg('Creating backup (.tabletnotes.zip)…');
     try {
+      const { buildBackupZipBytes, saveOrShareFileBytes } = await loadBackupManager();
       const bytes = await buildBackupZipBytes(curNb.id);
       await saveOrShareFileBytes(bytes, `${curNb.title || 'Notebook'}.tabletnotes.zip`, 'application/zip');
     } catch (err) {
@@ -1360,6 +1366,26 @@ export function Editor() {
           {busyMsg || saveLabel}
           {s.save === 'failed' && s.saveError ? `: ${s.saveError}` : ''}
         </span>
+        {s.save === 'failed' && (
+          <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <button
+              type="button"
+              className="chip"
+              onClick={() => void actions.retryFailedSaves()}
+              title="Retry saving unsaved notes to local storage"
+            >
+              Retry Save
+            </button>
+            <button
+              type="button"
+              className="chip"
+              onClick={() => void handleExportNotebookZip()}
+              title="Download emergency backup (.tabletnotes.zip)"
+            >
+              Export Backup
+            </button>
+          </span>
+        )}
         <button
           className={`icon blue ${s.pagesOpen ? 'on' : ''}`}
           aria-label="Pages and layers"
