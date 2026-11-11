@@ -1088,6 +1088,15 @@ function Pane({
             <ClipboardPaste size={16} />
           </button>
         )}
+        <button
+          className={`icon sm ${pageViewMode === 'continuous' ? 'on' : ''}`}
+          aria-label={pageViewMode === 'continuous' ? 'Switch to Single Page mode' : 'Switch to Continuous Scroll mode'}
+          title={pageViewMode === 'continuous' ? 'Continuous Scroll Active (click for Single Page)' : 'Single Page Active (click for Continuous Scroll)'}
+          onClick={() => actions.setPageViewMode(pageViewMode === 'continuous' ? 'single' : 'continuous')}
+          style={{ fontSize: 11, fontWeight: 600, padding: '0 6px', width: 'auto' }}
+        >
+          {pageViewMode === 'continuous' ? 'Continuous' : 'Single'}
+        </button>
       </div>
       <div className="zoomctl">
         <button

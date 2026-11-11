@@ -123,10 +123,12 @@ export interface ArbitrationState {
 export function arbitrate(pointerType: string, s: ArbitrationState): InputAction {
   if (pointerType === 'pen') return 'ink';
   if (pointerType === 'mouse') return 'ink';
+  // While pen is active or within palm guard window, reject finger/palm contact
   if (s.penDown || s.sincePenUp < s.guardMs) return 'ignore';
   if (s.touchCount >= 2) return 'navigate';
-  if (s.penOnly) return s.touchCount >= 1 ? 'navigate' : 'ignore';
-  return s.fingerDrawing ? 'ink' : 'ignore';
+  // In Pen-only mode (or whenever finger drawing is off), 1 finger navigates/scrolls
+  if (s.penOnly || !s.fingerDrawing) return 'navigate';
+  return 'ink';
 }
 
 /** Append a sample to a growable Float32 buffer. */

@@ -119,7 +119,6 @@ describe('input', () => {
   const base = { penOnly: true, fingerDrawing: false, penDown: false, sincePenUp: 1e6, guardMs: 250, touchCount: 1 };
   it('pen-only rejects single finger ink', () => {
     expect(arbitrate('touch', base)).toBe('navigate');
-    expect(arbitrate('touch', { ...base, touchCount: 0 })).toBe('ignore');
     expect(arbitrate('pen', base)).toBe('ink');
   });
   it('palm while pen down or in guard window is ignored', () => {
@@ -339,7 +338,7 @@ describe('deliberate swipe-to-add-page state machine & AddPageCommand', () => {
     // Pull beyond threshold arms the handle
     const s2 = ctrl.move(1, 600 - (SWIPE_ADD_THRESHOLD_PX + 12));
     expect(s2.state).toBe('armed');
-    expect(s2.label).toBe('Release to add page');
+    expect(s2.label).toBe('Release to add');
 
     // Release after sufficient duration commits once
     const res = ctrl.end(1, 100 + SWIPE_MIN_DURATION_MS + 40);

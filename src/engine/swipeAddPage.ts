@@ -1,4 +1,4 @@
-export const SWIPE_ADD_THRESHOLD_PX = 82;
+export const SWIPE_ADD_THRESHOLD_PX = 80;
 export const SWIPE_MAX_PULL_PX = 128;
 export const SWIPE_MIN_DURATION_MS = 80;
 
@@ -9,7 +9,7 @@ export interface SwipeAddSnapshot {
   pointerId: number | null;
   pullPx: number;
   progress: number;
-  label: 'Swipe up to add a page' | 'Release to add page';
+  label: 'Swipe up to add a page' | 'Release to add';
 }
 
 export interface SwipeStartContext {
@@ -43,7 +43,7 @@ export class SwipeToAddController {
       pointerId: this.pointerId,
       pullPx: this.pullPx,
       progress,
-      label: this.state === 'armed' ? 'Release to add page' : 'Swipe up to add a page',
+      label: this.state === 'armed' ? 'Release to add' : 'Swipe up to add a page',
     };
   }
 

@@ -88,6 +88,8 @@ export class InkSurface {
   private touches = new Map<number, { x: number; y: number }>();
   private activeId: number | null = null;
   private activeType = '';
+  private sessionCounter = 0;
+  private activeSessionToken = 0;
   private mode: Mode = 'ink';
   private buf: SampleBuffer | null = null;
   private stabilizerFilter: StrokeStabilizer | null = null;
@@ -96,7 +98,6 @@ export class InkSurface {
   private t0 = 0;
   private penDown = false;
   private lastPenUp = -1e9;
-  private completed = new Set<number>();
   private navLast: { cx: number; cy: number; d: number } | null = null;
   private fitted = false;
   private frameMs: number[] = [];
@@ -1092,11 +1093,43 @@ export class InkSurface {
     if (mode === 'pan' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown && !this.opts.disableCanvasPanWheel) {
       action = 'ink';
     }
-    if (action !== 'ink' || this.activeId !== null) return;
+
+    // 1-finger scrolling/panning in Pen-only mode (or when finger drawing is off)
+    if (action === 'navigate' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown) {
+      if (!this.opts.disableCanvasPanWheel) {
+        // In Single Page mode, surface handles 1-finger panning directly
+        e.preventDefault();
+        try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+        this.activeId = e.pointerId;
+        this.activeType = e.pointerType;
+        this.activeSessionToken = ++this.sessionCounter;
+        this.mode = 'pan';
+        this.panLast = { x: e.clientX, y: e.clientY };
+        return;
+      } else {
+        // In Continuous Scroll mode, let native touchAction ('pan-y pinch-zoom') handle vertical scroll smoothly
+        return;
+      }
+    }
+
+    if (action !== 'ink') return;
+
+    // For pen strokes, if another stroke was somehow still active (rapid pen strokes), finalize it immediately
+    if (e.pointerType === 'pen' && this.activeId !== null) {
+      if (this.mode === 'ink' && this.buf && this.buf.length > 0) {
+        this.finishInk();
+      } else {
+        this.cancelSession();
+      }
+    } else if (this.activeId !== null) {
+      return;
+    }
+
     e.preventDefault();
     try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
     this.activeId = e.pointerId;
     this.activeType = e.pointerType;
+    this.activeSessionToken = ++this.sessionCounter;
     this.mode = mode;
     if (e.pointerType === 'pen') this.penDown = true;
     this.opts.onStrokeStart?.();
@@ -1371,12 +1404,10 @@ export class InkSurface {
       this.penDown = false;
       this.lastPenUp = performance.now();
     }
-    if (e.pointerId !== this.activeId) return;
-    if (this.completed.has(e.pointerId)) return; // complete exactly once
-    this.completed.add(e.pointerId);
-    if (this.completed.size > 64) this.completed.clear();
+    if (e.pointerId !== this.activeId || this.activeSessionToken <= 0) return;
     const mode = this.mode;
     this.activeId = null;
+    this.activeSessionToken = 0;
     clearTimeout(this.holdTimer);
     if (this.rulerDrag) {
       this.rulerDrag = null;
@@ -1450,6 +1481,7 @@ export class InkSurface {
     this.rulerDrag = null;
     this.rulerTwoFinger = null;
     this.activeId = null;
+    this.activeSessionToken = 0;
     this.buf = null;
     this.stabilizerFilter = null;
     this.activeStrokeRect = null;
