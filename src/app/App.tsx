@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import { Analytics } from '@vercel/analytics/next';
+import { SpeedInsights } from '@vercel/speed-insights/next';
 import { actions, useApp } from './store';
 import { Library } from './Library';
 import { Editor } from './Editor';
@@ -20,6 +22,8 @@ export default function App() {
     <>
       {ready ? mode === 'welcome' ? <Welcome /> : mode === 'library' ? <Library /> : <Editor /> : null}
       <Opening ready={ready} error={error} onRetry={() => setAttempt((a) => a + 1)} />
+      <Analytics />
+      <SpeedInsights />
     </>
   );
 }

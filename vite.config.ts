@@ -5,6 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@vercel/analytics/next': '@vercel/analytics/react',
+      '@vercel/speed-insights/next': '@vercel/speed-insights/react',
+    },
+  },
   plugins: [
     react(),
     {
