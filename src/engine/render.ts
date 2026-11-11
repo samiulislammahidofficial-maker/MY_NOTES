@@ -51,22 +51,26 @@ export function strokePath(s: PathSrc, complete = true): Path2D {
   const pts: number[][] = [];
   for (let i = 0; i < n; i++) {
     const o = i * SAMPLE_STRIDE;
-    let p = Math.max(0.05, Math.min(1, s.samples[o + 2]));
-    if (tool === 'brush') p = 0.18 + 0.82 * Math.pow(p, 1.35);
-    if (tool === 'fountain' && i > 0) {
+    let p = Math.max(0.15, Math.min(1, s.samples[o + 2]));
+    if (tool === 'ballpoint') {
+      // Ballpoint pens have natural physical ink flow with gentle pressure response
+      p = 0.5 + 0.5 * p;
+    } else if (tool === 'brush') {
+      p = 0.25 + 0.75 * Math.pow(p, 1.25);
+    } else if (tool === 'fountain' && i > 0) {
       const dx = s.samples[o] - s.samples[o - SAMPLE_STRIDE], dy = s.samples[o + 1] - s.samples[o - SAMPLE_STRIDE + 1];
       if (Math.hypot(dx, dy) > 0.25) {
         const ang = Math.atan2(dy, dx);
-        p *= 0.42 + 0.58 * Math.abs(Math.sin(ang - Math.PI / 4));
+        p *= 0.5 + 0.5 * Math.abs(Math.sin(ang - Math.PI / 4));
       }
     }
     pts.push([s.samples[o], s.samples[o + 1], p]);
   }
   const cfg = {
-    ballpoint: { thinning: 0.08, smoothing: 0.35, streamline: 0.2 },
-    fountain: { thinning: 0.48, smoothing: 0.42, streamline: 0.25 },
-    brush: { thinning: 0.72, smoothing: 0.48, streamline: 0.28 },
-    highlighter: { thinning: 0, smoothing: 0.35, streamline: 0.2 },
+    ballpoint: { thinning: 0.04, smoothing: 0.55, streamline: 0.25 },
+    fountain: { thinning: 0.35, smoothing: 0.55, streamline: 0.25 },
+    brush: { thinning: 0.6, smoothing: 0.58, streamline: 0.28 },
+    highlighter: { thinning: 0, smoothing: 0.5, streamline: 0.2 },
   }[tool];
   const outline = getStroke(pts, {
     size: tool === 'brush' ? s.width * 1.45 : s.width,
@@ -76,8 +80,8 @@ export function strokePath(s: PathSrc, complete = true): Path2D {
     simulatePressure: false,
     // Keep last: true for both live and committed so lifting the pen never causes a sudden curve/width jump!
     last: true,
-    start: tool === 'highlighter' ? { cap: false } : undefined,
-    end: tool === 'highlighter' ? { cap: false } : undefined,
+    start: { cap: true, taper: 0 },
+    end: { cap: true, taper: 0 },
   });
   const p = new Path2D();
   if (outline.length < 2) {

@@ -444,6 +444,7 @@ export class InkSurface {
   }
 
   private paintStroke(ctx: CanvasRenderingContext2D, s: InkStroke, layerOpacity: number, dark: boolean) {
+    ctx.save();
     ctx.globalAlpha = s.opacity * layerOpacity;
     const style = s.rainbowSeed !== undefined ? createRainbowStyle(ctx, s.samples, s.rainbowSeed, s.color) : s.color;
     // highlighter: one filled outline composited once -> no self-overlap blotches
@@ -456,12 +457,12 @@ export class InkSurface {
       const w = Math.max(1.5, s.width);
       ctx.setLineDash(s.strokeStyle === 'dashed' ? [w * 3, w * 2.2] : [w * 0.2, w * 2.2]);
       ctx.stroke(centerlinePath(s.samples, s.id, s.revision));
-      ctx.setLineDash([]);
     } else {
+      ctx.setLineDash([]);
       ctx.fillStyle = style;
       ctx.fill(strokePath(s));
     }
-    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
   }
 
   private drawScene() {
@@ -666,6 +667,7 @@ export class InkSurface {
           ctx.stroke(centerlinePath(sub));
           ctx.setLineDash([]);
         } else {
+          ctx.setLineDash([]);
           ctx.fillStyle = style;
           ctx.fill(strokePath({ samples: sub, width: w, tool: hl ? 'highlighter' : tool.nib, smoothing: this.smoothing(tool) }, false));
         }

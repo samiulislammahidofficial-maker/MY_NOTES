@@ -28,7 +28,6 @@ import {
   List,
   Lock,
   LockOpen,
-  Maximize,
   MoreHorizontal,
   Pen,
   Plus,
@@ -42,7 +41,6 @@ import {
   Undo2,
   Upload,
   X,
-  ZoomIn,
 } from 'lucide-react';
 import katex from 'katex';
 import { actions, beginEssentialJob, getActiveLayer, getImages, getLayers, getPages, getStrokes, getTexts, useApp } from './store';
@@ -585,9 +583,9 @@ function Pane({
   const [sel, setSel] = useState<SelectionInfo | null>(null);
   const [convertTarget, setConvertTarget] = useState<{ page: Page; strokes: InkStroke[] } | null>(null);
   const [tapBox, setTapBox] = useState<{ pageId: string; x: number; y: number; text: string } | null>(null);
+  const [zoomScale, setZoomScale] = useState(1);
+  const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
   const [zoomWin, setZoomWin] = useState({ open: false, x: 40, y: 120, w: 200, h: 65, scale: 2.5 });
-  const zoomRef = useRef(zoomWin);
-  zoomRef.current = zoomWin;
 
   const syncRulerSurfaces = () => {
     surf.current?.invalidate();
@@ -615,7 +613,7 @@ function Pane({
       onActivate: () => actions.setActivePane(index),
       onSelection: setSel,
       onCopy: (list) => actions.copy(list),
-      getZoomRect: () => (zoomRef.current.open ? zoomRef.current : null),
+      onViewChange: (v) => setZoomScale(v.scale),
       onCanvasTap: (pt) => {
         const pid = pageOf();
         if (pid) setTapBox({ pageId: pid, x: pt.x, y: pt.y, text: '' });
@@ -1051,102 +1049,123 @@ function Pane({
         />
       )}
 
-      <div className="pager">
-        <button
-          className="icon sm"
-          disabled={idx <= 0}
-          aria-label="Previous page"
-          onClick={() => scrollToAndActivatePage(pages[idx - 1].id)}
-        >
-          ‹
-        </button>
-        <span>
-          {idx + 1} / {pages.length}
-        </span>
-        <button
-          className="icon sm"
-          disabled={idx >= pages.length - 1}
-          aria-label="Next page"
-          onClick={() => scrollToAndActivatePage(pages[idx + 1].id)}
-        >
-          ›
-        </button>
-        <button
-          className="icon sm"
-          aria-label="Add page below current page"
-          title="Add page below current page"
-          onClick={() => void handleAddPageAfterAndScroll(currentPage?.id)}
-        >
-          <Plus size={16} />
-        </button>
-        {hasClip && (
+      {/* Compact unified Tablet Bottom HUD (Non-overlapping & Responsive) */}
+      <div className="hud-bottom-bar" role="toolbar" aria-label="Page navigation and document view">
+        <div className="hud-pager-group">
           <button
-            className="icon sm"
-            aria-label="Paste"
-            onClick={() => surf.current?.paste(actions.getClipboard())}
+            className="icon xs hud-btn"
+            disabled={idx <= 0}
+            aria-label="Previous page"
+            onClick={() => scrollToAndActivatePage(pages[idx - 1].id)}
           >
-            <ClipboardPaste size={16} />
+            ‹
           </button>
-        )}
-        <button
-          className={`icon sm ${pageViewMode === 'continuous' ? 'on' : ''}`}
-          aria-label={pageViewMode === 'continuous' ? 'Switch to Single Page mode' : 'Switch to Continuous Scroll mode'}
-          title={pageViewMode === 'continuous' ? 'Continuous Scroll Active (click for Single Page)' : 'Single Page Active (click for Continuous Scroll)'}
-          onClick={() => actions.setPageViewMode(pageViewMode === 'continuous' ? 'single' : 'continuous')}
-          style={{ fontSize: 11, fontWeight: 600, padding: '0 6px', width: 'auto' }}
-        >
-          {pageViewMode === 'continuous' ? 'Continuous' : 'Single'}
-        </button>
-      </div>
-      <div className="zoomctl">
-        <button
-          className={`icon sm ${rulerVisible ? 'on' : ''}`}
-          aria-label="Toggle ruler"
-          aria-pressed={rulerVisible}
-          title="Toggle straightedge ruler (0–14 cm)"
-          onClick={() => actions.setTool({ rulerVisible: !rulerVisible })}
-        >
-          <Ruler size={18} />
-        </button>
-        <button
-          className={`icon sm ${zoomWin.open ? 'on' : ''}`}
-          aria-label="Magnified writing window"
-          aria-pressed={zoomWin.open}
-          onClick={() => setZoomWin((z) => ({ ...z, open: !z.open }))}
-        >
-          <ZoomIn size={18} />
-        </button>
-        <button
-          className="icon sm"
-          aria-label="Zoom out"
-          title="Zoom out"
-          onClick={() => surf.current?.zoomByFactor(0.85)}
-        >
-          −
-        </button>
-        <button
-          className="icon sm"
-          aria-label="Zoom in"
-          title="Zoom in"
-          onClick={() => surf.current?.zoomByFactor(1.15)}
-        >
-          +
-        </button>
-        <button
-          className="icon sm"
-          aria-label="Fit page width / Reset View"
-          title="Fit page width / Reset View"
-          onClick={() => {
-            if (pageViewMode === 'continuous' && scrollWrapRef.current) {
-              const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
-              activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            } else {
-              surf.current?.fit();
-            }
-          }}
-        >
-          <Maximize size={18} />
-        </button>
+          <span className="hud-status-badge" title="Current page">
+            {idx + 1} / {pages.length}
+          </span>
+          <button
+            className="icon xs hud-btn"
+            disabled={idx >= pages.length - 1}
+            aria-label="Next page"
+            onClick={() => scrollToAndActivatePage(pages[idx + 1].id)}
+          >
+            ›
+          </button>
+          <button
+            className="icon xs hud-btn"
+            aria-label="Add page below"
+            title="Add page below"
+            onClick={() => void handleAddPageAfterAndScroll(currentPage?.id)}
+          >
+            <Plus size={15} />
+          </button>
+          {hasClip && (
+            <button
+              className="icon xs hud-btn"
+              aria-label="Paste"
+              onClick={() => surf.current?.paste(actions.getClipboard())}
+            >
+              <ClipboardPaste size={14} />
+            </button>
+          )}
+        </div>
+
+        <div className="hud-view-group">
+          <button
+            className={`hud-mode-pill ${pageViewMode === 'continuous' ? 'on' : ''}`}
+            aria-label={pageViewMode === 'continuous' ? 'Switch to Single Page' : 'Switch to Continuous Scroll'}
+            onClick={() => actions.setPageViewMode(pageViewMode === 'continuous' ? 'single' : 'continuous')}
+          >
+            {pageViewMode === 'continuous' ? 'Continuous' : 'Single'}
+          </button>
+
+          <button
+            className={`icon xs hud-btn ${rulerVisible ? 'on' : ''}`}
+            aria-label="Toggle ruler"
+            aria-pressed={rulerVisible}
+            title="Toggle straightedge ruler"
+            onClick={() => actions.setTool({ rulerVisible: !rulerVisible })}
+          >
+            <Ruler size={15} />
+          </button>
+
+          {/* Zoom % readout + Quick View Affordance Popover */}
+          <div style={{ position: 'relative' }}>
+            <button
+              className={`hud-zoom-badge ${zoomMenuOpen ? 'on' : ''}`}
+              aria-label="Zoom actions"
+              aria-expanded={zoomMenuOpen}
+              onClick={() => setZoomMenuOpen((o) => !o)}
+            >
+              <span>{Math.round(zoomScale * 100)}%</span>
+            </button>
+
+            {zoomMenuOpen && (
+              <div className="popover hud-zoom-popover" role="dialog" aria-label="Zoom controls">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 6px' }}>
+                  <button
+                    className="icon xs"
+                    aria-label="Zoom out"
+                    title="Zoom out"
+                    onClick={() => surf.current?.zoomByFactor(0.85)}
+                  >
+                    −
+                  </button>
+                  <button
+                    className="icon xs"
+                    aria-label="Zoom in"
+                    title="Zoom in"
+                    onClick={() => surf.current?.zoomByFactor(1.15)}
+                  >
+                    +
+                  </button>
+                  <button
+                    className="chip"
+                    style={{ fontSize: 12, padding: '0 8px', minHeight: 28 }}
+                    onClick={() => {
+                      if (pageViewMode === 'continuous' && scrollWrapRef.current) {
+                        const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
+                        activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      } else {
+                        surf.current?.fit();
+                      }
+                      setZoomMenuOpen(false);
+                    }}
+                  >
+                    Fit
+                  </button>
+                  <button
+                    className="icon xs"
+                    aria-label="Close"
+                    onClick={() => setZoomMenuOpen(false)}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
       {zoomWin.open && (
         <div className="zoom-win" role="region" aria-label="Magnified writing window">
