@@ -107,6 +107,10 @@ export class InkSurface {
   private penDown = false;
   private lastPenUp = -1e9;
   private navLast: { cx: number; cy: number; d: number } | null = null;
+  /** Touch contacts rejected as palms (never eligible for navigation). */
+  private palmIds = new Set<number>();
+  /** event.timeStamp of the pointerdown that started the current session. */
+  private sessionStartTs = 0;
   private fitted = false;
   private frameMs: number[] = [];
   private hasCoalesced = typeof PointerEvent !== 'undefined' && 'getCoalescedEvents' in PointerEvent.prototype;
@@ -155,8 +159,9 @@ export class InkSurface {
         'position:absolute;inset:0;width:100%;height:100%;display:block;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none';
       host.appendChild(c);
     }
-    // touch-action:none ONLY on the drawing surface (or pan-y when in continuous scroll passive navigation)
-    this.live.style.touchAction = opts.disableCanvasPanWheel ? 'pan-y pinch-zoom' : 'none';
+    // In Continuous Scroll mode, use 'pan-y' without 'pinch-zoom' so the browser does not steal
+    // the gesture for whole-app visual viewport zoom. App-owned pinch is handled in surface.
+    this.live.style.touchAction = opts.disableCanvasPanWheel ? 'pan-y' : 'none';
     this.live.addEventListener('pointerdown', this.onDown);
     this.live.addEventListener('pointermove', this.onMove);
     this.live.addEventListener('pointerup', this.onUp);
@@ -990,10 +995,25 @@ export class InkSurface {
   }
 
   private onDown = (e: PointerEvent) => {
+    // Palm rejection BEFORE any gesture recognition: while a pen owns the surface (or within
+    // the short post-pen guard), touch contacts are recorded as ignored palms and never enter
+    // the navigation contact registry, so they cannot cancel ink or later form a pinch.
+    if (e.pointerType === 'touch') {
+      if (this.penDown || performance.now() - this.lastPenUp < 250) {
+        this.palmIds.add(e.pointerId);
+        return;
+      }
+      this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
     this.opts.onActivate?.();
-    if (e.pointerType === 'touch') this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     this.debugCounters.down++;
     if (e.pointerType === 'pen') {
+      // Pen takes ownership: drop any in-progress finger navigation state.
+      this.navLast = null;
+      this.rulerTwoFinger = null;
+      if (this.mode === 'pan' && this.activeType === 'touch' && this.activeId !== null) {
+        this.cancelSession();
+      }
       const now = performance.now();
       if (this.lastPenUp > 0) {
         this.debugCounters.lastGapMs = Math.round(now - this.lastPenUp);
@@ -1056,6 +1076,8 @@ export class InkSurface {
           /* synthetic pointer */
         }
         this.activeId = e.pointerId;
+        this.activeSessionToken = ++this.sessionCounter;
+        this.sessionStartTs = e.timeStamp;
         this.activeType = e.pointerType;
         const vx = d.x - this.ruler.x,
           vy = d.y - this.ruler.y;
@@ -1099,6 +1121,8 @@ export class InkSurface {
             /* synthetic */
           }
           this.activeId = e.pointerId;
+          this.activeSessionToken = ++this.sessionCounter;
+          this.sessionStartTs = e.timeStamp;
           this.activeType = e.pointerType;
           this.imageDrag = {
             kind: dragKind,
@@ -1130,8 +1154,9 @@ export class InkSurface {
         e.preventDefault();
         try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
         this.activeId = e.pointerId;
-        this.activeType = e.pointerType;
         this.activeSessionToken = ++this.sessionCounter;
+        this.sessionStartTs = e.timeStamp;
+        this.activeType = e.pointerType;
         this.mode = 'pan';
         this.panLast = { x: e.clientX, y: e.clientY };
         return;
@@ -1157,8 +1182,9 @@ export class InkSurface {
     e.preventDefault();
     try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
     this.activeId = e.pointerId;
-    this.activeType = e.pointerType;
     this.activeSessionToken = ++this.sessionCounter;
+    this.sessionStartTs = e.timeStamp;
+    this.activeType = e.pointerType;
     this.mode = mode;
     this.debugCounters.accepted++;
     if (e.pointerType === 'pen') this.penDown = true;
@@ -1295,6 +1321,7 @@ export class InkSurface {
   }
 
   private onMove = (e: PointerEvent) => {
+    if (this.palmIds.has(e.pointerId)) return;
     if (e.pointerType === 'touch' && this.touches.has(e.pointerId)) {
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this.rulerTwoFinger && this.touches.size >= 2) {
@@ -1428,7 +1455,14 @@ export class InkSurface {
     }
   };
 
+  /** True if this event predates the pointerdown of the current session (stale, same reused id). */
+  private isStaleForSession(e: PointerEvent) {
+    return this.activeId === e.pointerId && this.activeSessionToken > 0 && e.timeStamp < this.sessionStartTs;
+  }
+
   private onUp = (e: PointerEvent) => {
+    if (this.palmIds.delete(e.pointerId)) return;
+    if (this.isStaleForSession(e)) return;
     this.touches.delete(e.pointerId);
     this.debugCounters.up++;
     if (this.touches.size < 2) {
@@ -1486,13 +1520,15 @@ export class InkSurface {
   };
 
   private onCancel = (e: PointerEvent) => {
+    if (this.palmIds.delete(e.pointerId)) return;
+    if (this.isStaleForSession(e)) return;
     this.touches.delete(e.pointerId);
     this.debugCounters.cancel++;
     if (this.touches.size < 2) {
       this.navLast = null;
       this.rulerTwoFinger = null;
     }
-    if (e.pointerType === 'pen') {
+    if (e.pointerType === 'pen' && (this.activeId === null || this.activeId === e.pointerId)) {
       this.penDown = false;
       this.lastPenUp = performance.now();
     }
@@ -1503,11 +1539,17 @@ export class InkSurface {
   };
 
   private onLostPointerCapture = (e: PointerEvent) => {
-    // Normal capture release when pointer is already finalized/cleared is ignored.
-    // Only cancel if this capture loss actually belongs to an in-progress active session.
-    if (e.pointerId === this.activeId && this.activeSessionToken > 0) {
-      this.onCancel(e);
+    // A normal release of an already-finalized session is ignored (activeId was cleared on pointerup).
+    if (e.pointerId !== this.activeId || this.activeSessionToken <= 0) return;
+    // Stale loss from an earlier session that reused this pointerId: the new session started after it,
+    // or the new session currently still holds capture.
+    if (e.timeStamp < this.sessionStartTs) return;
+    try {
+      if (this.live.hasPointerCapture?.(e.pointerId)) return;
+    } catch {
+      /* synthetic pointer */
     }
+    this.onCancel(e);
   };
 
   /** Discard an incomplete gesture; committed content is preserved. */
@@ -1737,8 +1779,13 @@ export class InkSurface {
     const last = this.navLast!;
     let v: ViewMatrix = { ...this.view, tx: this.view.tx + (m.cx - last.cx), ty: this.view.ty + (m.cy - last.cy) };
     if (last.d > 4) v = zoomAbout(v, m.cx, m.cy, v.scale * (m.d / last.d));
-    this.view = v;
     this.navLast = m;
+    this.commitView(v);
+  }
+  /** Single entry point for gesture-driven view changes: validate bounds, notify, repaint. */
+  private commitView(v: ViewMatrix) {
+    this.view = this.applyBounds(v);
+    this.opts.onViewChange?.(this.view);
     this.invalidate();
   }
   private onWheel = (e: WheelEvent) => {
@@ -1748,10 +1795,9 @@ export class InkSurface {
     e.preventDefault();
     const r = this.rect();
     if (e.ctrlKey || e.metaKey) {
-      this.view = zoomAbout(this.view, e.clientX - r.left, e.clientY - r.top, this.view.scale * Math.exp(-e.deltaY * 0.01));
+      this.commitView(zoomAbout(this.view, e.clientX - r.left, e.clientY - r.top, this.view.scale * Math.exp(-e.deltaY * 0.01)));
     } else {
-      this.view = { ...this.view, tx: this.view.tx - e.deltaX, ty: this.view.ty - e.deltaY };
+      this.commitView({ ...this.view, tx: this.view.tx - e.deltaX, ty: this.view.ty - e.deltaY });
     }
-    this.invalidate();
   };
 }

@@ -392,6 +392,11 @@ function ContinuousPageCard({
   const mountCanvas = shouldMountCanvas || keepMountedForStroke || isActivePage;
   const isPageLocked = !!page.passwordLock && !isDocumentUnlockedInSession(page.id);
 
+  const isActivePageRef = useRef(isActivePage);
+  isActivePageRef.current = isActivePage;
+  const selectedImageIdRef = useRef(selectedImageId);
+  selectedImageIdRef.current = selectedImageId;
+
   useEffect(() => {
     if (!mountCanvas || !hostRef.current) {
       if (surfRef.current && !surfRef.current.isStrokeActive()) {
@@ -403,7 +408,7 @@ function ContinuousPageCard({
     const surface = new InkSurface(hostRef.current, {
       getTool: () => {
         const t = useApp.getState().tool;
-        return isActivePage ? t : { ...t, rulerVisible: false };
+        return isActivePageRef.current ? t : { ...t, rulerVisible: false };
       },
       getPaper: () => {
         const n = useApp.getState().notebooks.find((x) => x.id === page.notebookId);
@@ -413,7 +418,7 @@ function ContinuousPageCard({
       activeLayerId: () => getActiveLayer(page.id),
       getTexts: () => getTexts(page.id),
       getImages: () => getImages(page.id),
-      getSelectedImageId: () => (isActivePage ? selectedImageId : null),
+      getSelectedImageId: () => (isActivePageRef.current ? selectedImageIdRef.current : null),
       onImageSelect: (im) => onSelectImage(im?.id ?? null),
       onImageCommit: (prev, next) => actions.commitImageEdit(page.id, prev, next),
       onStroke: (st) => {
@@ -449,7 +454,7 @@ function ContinuousPageCard({
       surface.destroy();
       surfRef.current = null;
     };
-  }, [mountCanvas, page.id, page.notebookId, paneIndex, isActivePage]);
+  }, [mountCanvas, page.id, page.notebookId, paneIndex]);
 
   useEffect(() => {
     surfRef.current?.setStrokes(getStrokes(page.id));

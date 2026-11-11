@@ -34,7 +34,8 @@ export class SwipeToAddController {
   private startY = 0;
   private startTime = 0;
   private pullPx = 0;
-  private committedPointers = new Set<number>();
+  private gestureId = 0;
+  private gestureCommitted = false;
 
   getSnapshot(): SwipeAddSnapshot {
     const progress = Math.max(0, Math.min(1, this.pullPx / SWIPE_ADD_THRESHOLD_PX));
@@ -64,6 +65,8 @@ export class SwipeToAddController {
     this.startY = ctx.clientY;
     this.startTime = ctx.timeStamp;
     this.pullPx = 0;
+    this.gestureId++;
+    this.gestureCommitted = false;
     return this.getSnapshot();
   }
 
@@ -93,7 +96,7 @@ export class SwipeToAddController {
     if (this.state === 'idle' || pointerId !== this.pointerId) {
       return { shouldAddPage: false, snapshot: this.getSnapshot() };
     }
-    if (this.committedPointers.has(pointerId)) {
+    if (this.gestureCommitted) {
       this.cancel();
       return { shouldAddPage: false, snapshot: this.getSnapshot() };
     }
@@ -104,10 +107,7 @@ export class SwipeToAddController {
       duration >= SWIPE_MIN_DURATION_MS;
 
     if (armed) {
-      this.committedPointers.add(pointerId);
-      if (this.committedPointers.size > 64) {
-        this.committedPointers.clear();
-      }
+      this.gestureCommitted = true;
     }
     this.cancel();
     return { shouldAddPage: armed, snapshot: this.getSnapshot() };

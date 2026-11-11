@@ -1082,7 +1082,7 @@ button:disabled { opacity: .35; cursor: default; }
 }
 .continuous-pages-stack {
   width: 100%;
-  max-width: 1000px;
+  max-width: min(100%, 1400px);
   margin: 0 auto;
   display: flex;
   flex-direction: column;

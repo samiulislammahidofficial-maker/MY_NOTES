@@ -5,6 +5,23 @@ import Dexie from 'dexie';
 
 Dexie.dependencies.indexedDB = indexedDB;
 Dexie.dependencies.IDBKeyRange = IDBKeyRange;
+
+// Provide realistic memory-backed sessionStorage for Node/test environment
+if (typeof window !== 'undefined' && (!window.sessionStorage || typeof window.sessionStorage.getItem !== 'function')) {
+  const store = new Map<string, string>();
+  const mockStorage: Storage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, String(value)); },
+    removeItem: (key: string) => { store.delete(key); },
+    clear: () => { store.clear(); },
+    key: (index: number) => Array.from(store.keys())[index] ?? null,
+    get length() { return store.size; },
+  };
+  Object.defineProperty(window, 'sessionStorage', { value: mockStorage, configurable: true });
+}
+if (typeof globalThis !== 'undefined' && (!globalThis.sessionStorage || typeof globalThis.sessionStorage.getItem !== 'function')) {
+  Object.defineProperty(globalThis, 'sessionStorage', { value: window.sessionStorage, configurable: true });
+}
 import { clientToDoc, constrainView, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
 import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, UpdateImageBoxCommand, deserializeCommand, type StrokeTarget } from '../src/domain/history';
 import { isDrawingOrManipulationTool, isAllowedTextSelectionTarget } from '../src/engine/selectionGuard';
@@ -815,6 +832,46 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
       expect(v.scale).toBe(1);
       expect(Number.isFinite(v.tx)).toBe(true);
       expect(Number.isFinite(v.ty)).toBe(true);
+    });
+  });
+
+  describe('swipe-to-add sequential gesture deduplication', () => {
+    it('allows a subsequent legitimate swipe reusing the same pointerId after completion', () => {
+      const ctrl = new SwipeToAddController();
+      // First gesture using pointerId 5
+      const s0 = ctrl.start({
+        pointerId: 5,
+        pointerType: 'touch',
+        clientY: 600,
+        timeStamp: 100,
+        activeTouchCount: 1,
+        penDown: false,
+        rulerDragging: false,
+      });
+      expect(s0.state).toBe('dragging');
+      ctrl.move(5, 600 - (SWIPE_ADD_THRESHOLD_PX + 15));
+      const r1 = ctrl.end(5, 100 + SWIPE_MIN_DURATION_MS + 50);
+      expect(r1.shouldAddPage).toBe(true);
+      expect(r1.snapshot.state).toBe('idle');
+
+      // Immediate duplicate pointerup for the finished gesture returns false
+      const dup = ctrl.end(5, 100 + SWIPE_MIN_DURATION_MS + 60);
+      expect(dup.shouldAddPage).toBe(false);
+
+      // A NEW legitimate gesture later in time using the SAME pointerId (e.g. reused touch ID)
+      const s2 = ctrl.start({
+        pointerId: 5,
+        pointerType: 'touch',
+        clientY: 600,
+        timeStamp: 500,
+        activeTouchCount: 1,
+        penDown: false,
+        rulerDragging: false,
+      });
+      expect(s2.state).toBe('dragging');
+      ctrl.move(5, 600 - (SWIPE_ADD_THRESHOLD_PX + 20));
+      const r2 = ctrl.end(5, 500 + SWIPE_MIN_DURATION_MS + 50);
+      expect(r2.shouldAddPage).toBe(true);
     });
   });
 });
