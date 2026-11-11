@@ -3,8 +3,38 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
+
+function readBuildMetadata() {
+  let pkgVersion = '0.1.0';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8')) as { version?: string };
+    if (pkg.version) pkgVersion = pkg.version;
+  } catch {
+    /* ignore */
+  }
+  let commit = process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || '';
+  if (!commit) {
+    try {
+      commit = execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8').trim();
+    } catch {
+      commit = 'local';
+    }
+  }
+  const builtAt = new Date().toISOString();
+  const buildId = `v${pkgVersion} (${commit})`;
+  return { pkgVersion, commit, builtAt, buildId };
+}
+
+const buildMeta = readBuildMetadata();
 
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(buildMeta.pkgVersion),
+    __APP_COMMIT__: JSON.stringify(buildMeta.commit),
+    __APP_BUILD_ID__: JSON.stringify(buildMeta.buildId),
+    __APP_BUILT_AT__: JSON.stringify(buildMeta.builtAt),
+  },
   resolve: {
     alias: {
       '@vercel/analytics/next': '@vercel/analytics/react',
@@ -47,7 +77,13 @@ export default defineConfig({
     },
     VitePWA({
       registerType: 'prompt',
-      includeAssets: ['icons/icon-512.svg', 'tutorial/poster.png', 'tutorial/captions.en.vtt', 'tutorial/captions.bn.vtt'],
+      includeAssets: [
+        'icons/icon-512.svg',
+        'fonts/NotoSansBengali-Regular.ttf',
+        'tutorial/poster.png',
+        'tutorial/captions.en.vtt',
+        'tutorial/captions.bn.vtt',
+      ],
       manifest: {
         name: 'My Notes',
         short_name: 'My Notes',
@@ -69,9 +105,11 @@ export default defineConfig({
       workbox: {
         // Keep the tutorial MP4 AND the 21.6 MB ONNX Runtime WASM out of critical first-visit precache!
         // Include pdf.worker.min.mjs in precache so offline PDF import/rendering works 100% offline.
-        globPatterns: ['**/*.{js,mjs,css,html,ico,png,svg,vtt,webmanifest}'],
+        globPatterns: ['**/*.{js,mjs,css,html,ico,png,svg,vtt,ttf,webmanifest}'],
         globIgnores: ['**/tutorial/*.mp4', '**/ort-wasm*.wasm', '**/trocrWorker*.js'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        cleanupOutdatedCaches: true,
+        navigateFallbackDenylist: [/\/assets\/.*/, /\/tutorial\/.*/, /\/icons\/.*/, /\/fonts\/.*/, /\.(?:js|mjs|css|wasm|json|png|svg|mp4|vtt|ttf|zip)$/i],
         runtimeCaching: [
           {
             urlPattern: /\/tutorial\/.*\.(mp4|vtt|png)$/,

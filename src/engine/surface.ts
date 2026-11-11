@@ -1,7 +1,7 @@
-import type { InkStroke, Page, Template, TextBox, ViewMatrix } from '../domain/types';
+import type { ImageBox, InkStroke, Page, Template, TextBox, ViewMatrix } from '../domain/types';
 import { SAMPLE_STRIDE, isDark } from '../domain/types';
-import { clientToDoc, fitPage, zoomAbout } from '../domain/geometry';
-import { SampleBuffer, arbitrate, expandEvents, resolvePressure } from './input';
+import { clientToDoc, fitPage, fitWidth, zoomAbout } from '../domain/geometry';
+import { SampleBuffer, StrokeStabilizer, arbitrate, expandEvents, resolvePressure } from './input';
 import { applyView, boundsOf, centerlinePath, createRainbowStyle, strokePath } from './render';
 import {
   type Pt,
@@ -44,7 +44,14 @@ export interface SurfaceOptions {
   /** If true, fit page to fill the host width & height exactly (used in Continuous Scroll). */
   fitFullHost?: boolean;
   getTexts?(): TextBox[];
+  getSelectedTextId?(): string | null;
+  getImages?(): ImageBox[];
+  getSelectedImageId?(): string | null;
   onCanvasTap?(docPt: { x: number; y: number }): void;
+  onTextSelect?(tb: TextBox): void;
+  onImageSelect?(img: ImageBox | null): void;
+  onImageCommit?(prev: ImageBox, next: ImageBox): void;
+  onViewChange?(v: ViewMatrix): void;
   onCloseRuler?(): void;
   onStrokeStart?(): void;
   getRuler?(): { x: number; y: number; angle: number };
@@ -83,6 +90,9 @@ export class InkSurface {
   private activeType = '';
   private mode: Mode = 'ink';
   private buf: SampleBuffer | null = null;
+  private stabilizerFilter: StrokeStabilizer | null = null;
+  private activeStrokeRect: DOMRect | null = null;
+  private activeStrokeView: ViewMatrix | null = null;
   private t0 = 0;
   private penDown = false;
   private lastPenUp = -1e9;
@@ -120,6 +130,13 @@ export class InkSurface {
   private rulerTwoFinger: { cx: number; cy: number; angle: number; rx: number; ry: number; ra: number } | null = null;
   private bgCanvas: HTMLCanvasElement | HTMLImageElement | null = null;
   private bgPageKey = '';
+  private imageElements = new Map<string, HTMLImageElement>();
+  private imageDrag: {
+    kind: 'move' | 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br';
+    img: ImageBox;
+    initialBounds: { x0: number; y0: number; x1: number; y1: number };
+    startDoc: Pt;
+  } | null = null;
 
   constructor(private host: HTMLElement, private opts: SurfaceOptions) {
     host.style.userSelect = 'none';
@@ -138,16 +155,71 @@ export class InkSurface {
     this.live.addEventListener('lostpointercapture', this.onCancel);
     this.live.addEventListener('wheel', this.onWheel, { passive: false });
     this.live.addEventListener('contextmenu', (e) => e.preventDefault());
+    window.addEventListener('mynotes:quiesce-for-update', this.onQuiesceForUpdate);
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(host);
     this.resize();
+  }
+
+  private onQuiesceForUpdate = () => {
+    this.completeOrCancelActiveGestureSafely();
+  };
+
+  private async loadImageAsset(assetId: string) {
+    if (this.imageElements.has(assetId)) return;
+    try {
+      const { blobStore } = await import('../storage/blobStore');
+      const bytes = await blobStore.get(assetId);
+      if (!bytes) return;
+      const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer]);
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        this.imageElements.set(assetId, img);
+        this.invalidate();
+      };
+      img.src = url;
+    } catch {
+      /* ignore */
+    }
   }
 
   destroy() {
     clearTimeout(this.holdTimer);
     cancelAnimationFrame(this.raf);
     this.ro.disconnect();
+    window.removeEventListener('mynotes:quiesce-for-update', this.onQuiesceForUpdate);
     this.host.replaceChildren();
+  }
+
+  /**
+   * Safely finishes or cancels an in-progress gesture before a user-confirmed app update.
+   */
+  completeOrCancelActiveGestureSafely() {
+    if (this.activeId === null && !this.penDown && !this.rulerDrag && !this.rulerTwoFinger) return;
+    clearTimeout(this.holdTimer);
+    if (this.rulerDrag || this.rulerTwoFinger) {
+      this.rulerDrag = null;
+      this.rulerTwoFinger = null;
+      this.activeId = null;
+      this.penDown = false;
+      this.liveDirty = true;
+      this.schedule();
+      return;
+    }
+    const mode = this.mode;
+    this.activeId = null;
+    this.penDown = false;
+    if (mode === 'ink' && this.buf && this.buf.length > 0) {
+      this.finishInk();
+    } else if (mode === 'erase' && this.eraseTouched.size > 0) {
+      this.finishErase();
+    } else {
+      this.cancelSession();
+    }
+    this.liveDirty = true;
+    this.schedule();
   }
 
   getView() {
@@ -216,13 +288,26 @@ export class InkSurface {
   }
   setView(v: ViewMatrix) {
     this.view = v;
+    this.opts.onViewChange?.(this.view);
     this.invalidate();
   }
   isStrokeActive() {
     return this.activeId !== null || this.penDown;
   }
 
-  fit() {
+  fitWidthView() {
+    if (!this.page) return;
+    if (this.opts.fitFullHost) {
+      const scale = this.cssW / Math.max(1, this.page.width);
+      this.view = { scale, tx: 0, ty: 0 };
+    } else {
+      this.view = fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16);
+    }
+    this.opts.onViewChange?.(this.view);
+    this.invalidate();
+  }
+
+  fitPageView() {
     if (!this.page) return;
     if (this.opts.fitFullHost) {
       const scale = this.cssW / Math.max(1, this.page.width);
@@ -230,7 +315,19 @@ export class InkSurface {
     } else {
       this.view = fitPage(this.cssW, this.cssH, this.page.width, this.page.height);
     }
+    this.opts.onViewChange?.(this.view);
     this.invalidate();
+  }
+
+  zoomByFactor(factor: number) {
+    const targetScale = this.view.scale * factor;
+    this.view = zoomAbout(this.view, this.cssW / 2, this.cssH / 2, targetScale);
+    this.opts.onViewChange?.(this.view);
+    this.invalidate();
+  }
+
+  fit() {
+    this.fitWidthView();
   }
   invalidate() {
     this.sceneDirty = true;
@@ -241,7 +338,7 @@ export class InkSurface {
   private maybeFit() {
     if (this.opts.disableAutoFit) return;
     if (!this.fitted && this.page && this.cssW > 8) {
-      this.fit();
+      this.fitWidthView();
       this.fitted = true;
     }
   }
@@ -362,10 +459,36 @@ export class InkSurface {
       ctx.drawImage(this.bgCanvas, 0, 0, this.page.width, this.page.height);
     }
     this.drawTemplate(ctx, spec.template, dark);
+
+    const lm = this.layerMap();
+    // Draw user-inserted Question / Exercise photos underneath or at their layer level
+    const pageImages = this.opts.getImages?.() ?? [];
+    for (const img of pageImages) {
+      const l = lm.get(img.layerId);
+      if (l && !l.visible) continue;
+      const cached = this.imageElements.get(img.assetId);
+      const w = img.bounds.x1 - img.bounds.x0;
+      const h = img.bounds.y1 - img.bounds.y0;
+      ctx.globalAlpha = (img.opacity ?? 1) * (l?.opacity ?? 1);
+      if (cached && cached.complete && cached.naturalWidth > 0) {
+        ctx.drawImage(cached, img.bounds.x0, img.bounds.y0, w, h);
+      } else {
+        // Placeholder outline while async loading from IndexedDB blobStore
+        ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.06)' : 'rgba(0, 0, 0, 0.05)';
+        ctx.fillRect(img.bounds.x0, img.bounds.y0, w, h);
+        ctx.strokeStyle = dark ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.15)';
+        ctx.lineWidth = 1 / this.view.scale;
+        ctx.strokeRect(img.bounds.x0, img.bounds.y0, w, h);
+        if (!cached) {
+          void this.loadImageAsset(img.assetId);
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
     ctx.strokeStyle = paper.line;
     ctx.lineWidth = 1 / this.view.scale;
     ctx.strokeRect(0, 0, this.page.width, this.page.height);
-    const lm = this.layerMap();
     const vx0 = -this.view.tx / this.view.scale;
     const vy0 = -this.view.ty / this.view.scale;
     const vx1 = vx0 + this.cssW / this.view.scale;
@@ -388,6 +511,7 @@ export class InkSurface {
       } else this.paintStroke(ctx, s, l?.opacity ?? 1, dark);
     }
     const texts = this.opts.getTexts?.() ?? [];
+    const selTextId = this.opts.getSelectedTextId?.() ?? null;
     for (const tb of texts) {
       const l = lm.get(tb.layerId);
       if (l && !l.visible) continue;
@@ -398,10 +522,71 @@ export class InkSurface {
       ctx.textAlign = tb.align;
       const lines = tb.text.split('\n');
       const lh = tb.fontSize * (tb.lineHeight || 1.3);
+      let maxMeasuredW = 0;
+      lines.forEach((line) => {
+        maxMeasuredW = Math.max(maxMeasuredW, ctx.measureText(line).width);
+      });
+      // Update dynamic bounds width/height in place for accurate hit testing
+      tb.bounds.x1 = Math.max(tb.bounds.x1, tb.bounds.x0 + maxMeasuredW + 8);
+      tb.bounds.y1 = Math.max(tb.bounds.y1, tb.bounds.y0 + Math.max(1, lines.length) * lh + 4);
       const ax = tb.align === 'center' ? (tb.bounds.x0 + tb.bounds.x1) / 2 : tb.align === 'right' ? tb.bounds.x1 : tb.bounds.x0;
       lines.forEach((line, idx) => {
         ctx.fillText(line, ax, tb.bounds.y0 + idx * lh);
       });
+      if (selTextId === tb.id) {
+        ctx.save();
+        ctx.strokeStyle = '#0A84FF';
+        ctx.lineWidth = 1.5 / this.view.scale;
+        ctx.setLineDash([4 / this.view.scale, 3 / this.view.scale]);
+        ctx.strokeRect(tb.bounds.x0 - 4, tb.bounds.y0 - 4, tb.bounds.x1 - tb.bounds.x0 + 8, tb.bounds.y1 - tb.bounds.y0 + 8);
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#0A84FF';
+        const hs = 4.5 / this.view.scale;
+        for (const [hx, hy] of [
+          [tb.bounds.x0 - 4, tb.bounds.y0 - 4],
+          [tb.bounds.x1 + 4, tb.bounds.y0 - 4],
+          [tb.bounds.x0 - 4, tb.bounds.y1 + 4],
+          [tb.bounds.x1 + 4, tb.bounds.y1 + 4],
+        ]) {
+          ctx.beginPath();
+          ctx.arc(hx, hy, hs, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+    }
+    const selImgId = this.opts.getSelectedImageId?.() ?? null;
+    if (selImgId) {
+      const selectedImg = pageImages.find((im) => im.id === selImgId);
+      if (selectedImg) {
+        ctx.save();
+        ctx.strokeStyle = '#0A84FF';
+        ctx.lineWidth = 1.8 / this.view.scale;
+        ctx.setLineDash([5 / this.view.scale, 3.5 / this.view.scale]);
+        ctx.strokeRect(
+          selectedImg.bounds.x0 - 2,
+          selectedImg.bounds.y0 - 2,
+          selectedImg.bounds.x1 - selectedImg.bounds.x0 + 4,
+          selectedImg.bounds.y1 - selectedImg.bounds.y0 + 4,
+        );
+        ctx.setLineDash([]);
+        const hs = 6.5 / this.view.scale;
+        for (const [hx, hy] of [
+          [selectedImg.bounds.x0, selectedImg.bounds.y0],
+          [selectedImg.bounds.x1, selectedImg.bounds.y0],
+          [selectedImg.bounds.x0, selectedImg.bounds.y1],
+          [selectedImg.bounds.x1, selectedImg.bounds.y1],
+        ]) {
+          ctx.beginPath();
+          ctx.arc(hx, hy, hs, 0, Math.PI * 2);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fill();
+          ctx.strokeStyle = '#0A84FF';
+          ctx.lineWidth = 2 / this.view.scale;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
     }
     ctx.textAlign = 'left';
     ctx.globalAlpha = 1;
@@ -856,6 +1041,46 @@ export class InkSurface {
       }
     }
 
+    // Image manipulation (resize handles or drag to move selected image)
+    const selImgId = this.opts.getSelectedImageId?.();
+    if (selImgId && this.activeId === null && !this.penDown) {
+      const pageImgs = this.opts.getImages?.() ?? [];
+      const selectedImg = pageImgs.find((im) => im.id === selImgId);
+      if (selectedImg) {
+        const b = selectedImg.bounds;
+        const cornerR = Math.max(16, 20 / this.view.scale);
+        let dragKind: 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br' | 'move' | null = null;
+        if (Math.hypot(d.x - b.x0, d.y - b.y0) <= cornerR) dragKind = 'resize-tl';
+        else if (Math.hypot(d.x - b.x1, d.y - b.y0) <= cornerR) dragKind = 'resize-tr';
+        else if (Math.hypot(d.x - b.x0, d.y - b.y1) <= cornerR) dragKind = 'resize-bl';
+        else if (Math.hypot(d.x - b.x1, d.y - b.y1) <= cornerR) dragKind = 'resize-br';
+        else if (
+          (tool.kind === 'text' || tool.kind === 'lasso' || tool.kind === 'hand') &&
+          d.x >= b.x0 && d.x <= b.x1 && d.y >= b.y0 && d.y <= b.y1
+        ) {
+          dragKind = 'move';
+        }
+
+        if (dragKind) {
+          e.preventDefault();
+          try {
+            this.live.setPointerCapture(e.pointerId);
+          } catch {
+            /* synthetic */
+          }
+          this.activeId = e.pointerId;
+          this.activeType = e.pointerType;
+          this.imageDrag = {
+            kind: dragKind,
+            img: selectedImg,
+            initialBounds: { ...selectedImg.bounds },
+            startDoc: d,
+          };
+          return;
+        }
+      }
+    }
+
     let action = arbitrate(e.pointerType, {
       penOnly: tool.penOnly,
       fingerDrawing: tool.fingerDrawing,
@@ -879,12 +1104,50 @@ export class InkSurface {
     if (tool.kind === 'text') {
       this.activeId = null;
       this.penDown = false;
+      const texts = this.opts.getTexts?.() ?? [];
+      const lm = this.layerMap();
+      const pad = 6;
+      const hitTb = [...texts].reverse().find((tb) => {
+        const l = lm.get(tb.layerId);
+        if (l && (!l.visible || l.locked)) return false;
+        return (
+          d.x >= tb.bounds.x0 - pad &&
+          d.x <= tb.bounds.x1 + pad &&
+          d.y >= tb.bounds.y0 - pad &&
+          d.y <= tb.bounds.y1 + pad
+        );
+      });
+      if (hitTb && this.opts.onTextSelect) {
+        this.opts.onTextSelect(hitTb);
+        return;
+      }
+
+      // Check if user clicked an inserted image to select/edit/resize/move it
+      const images = this.opts.getImages?.() ?? [];
+      const hitImg = [...images].reverse().find((im) => {
+        const l = lm.get(im.layerId);
+        if (l && (!l.visible || l.locked)) return false;
+        return (
+          d.x >= im.bounds.x0 - pad &&
+          d.x <= im.bounds.x1 + pad &&
+          d.y >= im.bounds.y0 - pad &&
+          d.y <= im.bounds.y1 + pad
+        );
+      });
+      if (hitImg && this.opts.onImageSelect) {
+        this.opts.onImageSelect(hitImg);
+        return;
+      }
+
       this.opts.onCanvasTap?.(d);
       return;
     }
     switch (mode) {
       case 'ink':
         this.buf = new SampleBuffer();
+        this.stabilizerFilter = new StrokeStabilizer(tool.penSmoothing ?? 'low');
+        this.activeStrokeRect = this.rect();
+        this.activeStrokeView = { ...this.view };
         this.snappedShape = null;
         this.liveSeed = (Date.now() * 137) % 360;
         this.t0 = e.timeStamp;
@@ -916,9 +1179,13 @@ export class InkSurface {
   private addSamples(evs: PointerEvent[]) {
     if (!this.buf) return;
     const tool = this.opts.getTool();
-    const r = this.rect();
+    const r = this.activeStrokeRect ?? this.rect();
+    const v = this.activeStrokeView ?? this.view;
     for (const ev of evs) {
-      let d = clientToDoc(ev.clientX, ev.clientY, r, this.view);
+      let d = clientToDoc(ev.clientX, ev.clientY, r, v);
+      const tMs = Math.max(0, ev.timeStamp - this.t0);
+      const rawP = resolvePressure(ev.pointerType, ev.pressure, tool.constantPressure, this.buf.length > 0);
+      let p = rawP;
       if (tool.rulerVisible) {
         if (this.opts.getRuler) {
           const ext = this.opts.getRuler();
@@ -927,9 +1194,21 @@ export class InkSurface {
           this.ruler.angle = ext.angle;
         }
         d = snapToRuler(d, this.ruler.x, this.ruler.y, this.ruler.angle, 18, RULER_HALF_H, RULER_HALF_LEN);
+      } else if (this.stabilizerFilter) {
+        const filtered = this.stabilizerFilter.filterSample(d.x, d.y, rawP, tMs);
+        d = { x: filtered.x, y: filtered.y };
+        p = filtered.p;
       }
-      const p = resolvePressure(ev.pointerType, ev.pressure, tool.constantPressure);
-      this.buf.push(d.x, d.y, p, ev.tiltX || 0, ev.tiltY || 0, ev.timeStamp - this.t0);
+      // Deduplicate identical zero-movement samples except the very first point
+      if (this.buf.length > 0) {
+        const prevOff = (this.buf.length - 1) * SAMPLE_STRIDE;
+        const dx = d.x - this.buf.data[prevOff];
+        const dy = d.y - this.buf.data[prevOff + 1];
+        if (Math.hypot(dx, dy) < 0.08 && Math.abs(tMs - this.buf.data[prevOff + 5]) < 2) {
+          continue;
+        }
+      }
+      this.buf.push(d.x, d.y, p, ev.tiltX || 0, ev.tiltY || 0, tMs);
     }
     clearTimeout(this.holdTimer);
     if (this.snappedShape && evs.length) {
@@ -978,6 +1257,57 @@ export class InkSurface {
       }
     }
     if (e.pointerId !== this.activeId) return;
+    if (this.imageDrag) {
+      const d = this.doc(e);
+      const dx = d.x - this.imageDrag.startDoc.x;
+      const dy = d.y - this.imageDrag.startDoc.y;
+      const init = this.imageDrag.initialBounds;
+      const ar = this.imageDrag.img.aspectRatio || Math.max(0.1, (init.x1 - init.x0) / Math.max(1, init.y1 - init.y0));
+      const pW = this.page?.width ?? 600;
+      const pH = this.page?.height ?? 800;
+
+      if (this.imageDrag.kind === 'move') {
+        const w = init.x1 - init.x0;
+        const h = init.y1 - init.y0;
+        const nx0 = Math.max(0, Math.min(pW - w, init.x0 + dx));
+        const ny0 = Math.max(0, Math.min(pH - h, init.y0 + dy));
+        this.imageDrag.img.bounds = { x0: nx0, y0: ny0, x1: nx0 + w, y1: ny0 + h };
+      } else if (this.imageDrag.kind === 'resize-br') {
+        let w = Math.max(60, Math.min(pW - init.x0, init.x1 - init.x0 + dx));
+        let h = w / ar;
+        if (init.y0 + h > pH) {
+          h = pH - init.y0;
+          w = h * ar;
+        }
+        this.imageDrag.img.bounds = { x0: init.x0, y0: init.y0, x1: init.x0 + w, y1: init.y0 + h };
+      } else if (this.imageDrag.kind === 'resize-bl') {
+        let w = Math.max(60, Math.min(init.x1, init.x1 - (init.x0 + dx)));
+        let h = w / ar;
+        if (init.y0 + h > pH) {
+          h = pH - init.y0;
+          w = h * ar;
+        }
+        this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y0, x1: init.x1, y1: init.y0 + h };
+      } else if (this.imageDrag.kind === 'resize-tr') {
+        let w = Math.max(60, Math.min(pW - init.x0, init.x1 - init.x0 + dx));
+        let h = w / ar;
+        if (init.y1 - h < 0) {
+          h = init.y1;
+          w = h * ar;
+        }
+        this.imageDrag.img.bounds = { x0: init.x0, y0: init.y1 - h, x1: init.x0 + w, y1: init.y1 };
+      } else if (this.imageDrag.kind === 'resize-tl') {
+        let w = Math.max(60, Math.min(init.x1, init.x1 - (init.x0 + dx)));
+        let h = w / ar;
+        if (init.y1 - h < 0) {
+          h = init.y1;
+          w = h * ar;
+        }
+        this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y1 - h, x1: init.x1, y1: init.y1 };
+      }
+      this.invalidate();
+      return;
+    }
     if (this.rulerDrag) {
       const d = this.doc(e);
       if (this.rulerDrag.kind === 'move') {
@@ -1054,8 +1384,30 @@ export class InkSurface {
       this.schedule();
       return;
     }
+    if (this.imageDrag) {
+      const prev = { ...this.imageDrag.img, bounds: { ...this.imageDrag.initialBounds } };
+      const next = { ...this.imageDrag.img, bounds: { ...this.imageDrag.img.bounds }, revision: this.imageDrag.img.revision + 1 };
+      this.imageDrag = null;
+      if (
+        Math.abs(next.bounds.x0 - prev.bounds.x0) > 0.5 ||
+        Math.abs(next.bounds.y0 - prev.bounds.y0) > 0.5 ||
+        Math.abs(next.bounds.x1 - prev.bounds.x1) > 0.5 ||
+        Math.abs(next.bounds.y1 - prev.bounds.y1) > 0.5
+      ) {
+        this.opts.onImageCommit?.(prev, next);
+      }
+      this.liveDirty = true;
+      this.schedule();
+      return;
+    }
     switch (mode) {
-      case 'ink': this.finishInk(); break;
+      case 'ink':
+        // Append the real pointerup endpoint if it moved from the last recorded sample
+        if (this.buf && this.buf.length > 0 && !this.snappedShape) {
+          this.addSamples([e]);
+        }
+        this.finishInk();
+        break;
       case 'erase': this.finishErase(); break;
       case 'shape': this.finishShape(e); break;
       case 'lasso': this.finishLasso(); break;
@@ -1089,12 +1441,19 @@ export class InkSurface {
       this.eraseFrag.clear();
     }
     if (this.drag && this.sel) this.sel.t = { ...ID_T };
+    if (this.imageDrag) {
+      this.imageDrag.img.bounds = { ...this.imageDrag.initialBounds };
+      this.imageDrag = null;
+    }
     clearTimeout(this.holdTimer);
     this.snappedShape = null;
     this.rulerDrag = null;
     this.rulerTwoFinger = null;
     this.activeId = null;
     this.buf = null;
+    this.stabilizerFilter = null;
+    this.activeStrokeRect = null;
+    this.activeStrokeView = null;
     this.eraseAt = null;
     this.shapeA = this.shapeB = null;
     this.lasso = [];
@@ -1109,6 +1468,9 @@ export class InkSurface {
     const type = this.activeType;
     const snap = this.snappedShape;
     this.buf = null;
+    this.stabilizerFilter = null;
+    this.activeStrokeRect = null;
+    this.activeStrokeView = null;
     this.snappedShape = null;
     if (!buf || !this.page || buf.length === 0) return;
     const tool = this.opts.getTool();

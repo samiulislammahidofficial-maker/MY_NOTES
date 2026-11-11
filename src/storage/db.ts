@@ -1,5 +1,5 @@
 import Dexie, { type Table } from 'dexie';
-import type { AssetRecord, CustomFontRecord, InkStroke, Layer, Notebook, Page, TextBox } from '../domain/types';
+import type { AssetRecord, CustomFontRecord, ImageBox, InkStroke, Layer, Notebook, Page, TextBox } from '../domain/types';
 
 export interface StrokeRow extends Omit<InkStroke, 'samples'> {
   samples: ArrayBuffer;
@@ -16,6 +16,7 @@ class NotesDB extends Dexie {
   layers!: Table<Layer, string>;
   strokes!: Table<StrokeRow, string>;
   texts!: Table<TextBox, string>;
+  images!: Table<ImageBox, string>;
   assets!: Table<AssetRecord, string>;
   fonts!: Table<CustomFontRecord, string>;
   blobs!: Table<BlobRow, string>;
@@ -38,6 +39,17 @@ class NotesDB extends Dexie {
       fonts: 'id, family, sha256',
       blobs: 'id',
     });
+    this.version(3).stores({
+      notebooks: 'id, updatedAt, trashedAt, pinned',
+      pages: 'id, notebookId',
+      layers: 'id, pageId',
+      strokes: 'id, pageId, layerId, order',
+      texts: 'id, pageId, layerId, order',
+      images: 'id, pageId, layerId, order',
+      assets: 'id, kind, sha256',
+      fonts: 'id, family, sha256',
+      blobs: 'id',
+    });
   }
 }
 
@@ -49,17 +61,38 @@ export const toRow = (s: InkStroke): StrokeRow => ({
 });
 export const fromRow = (r: StrokeRow): InkStroke => ({ ...r, samples: new Float32Array(r.samples) });
 
+/**
+ * Pure, testable migration normalizer for legacy v1/v2 notebook records.
+ * Preserves unknown future fields (`schemaVersion`, future extensions) so a hosting rollback
+ * or older tab never strips or resets newer local data.
+ */
+export function normalizeLegacyNotebookRecord(raw: Partial<Notebook> & { id: string; title?: string }): Notebook {
+  const legacyPaper: Record<string, string> = { black: '#000000', white: '#FFFFFF', cream: '#FFFDF0' };
+  const paperRaw = raw.paper ?? '#000000';
+  return {
+    ...raw,
+    id: raw.id,
+    title: raw.title ?? 'Untitled',
+    cover: raw.cover ?? '#385E51',
+    hasCover: raw.hasCover ?? true,
+    template: raw.template ?? 'blank',
+    size: raw.size ?? 'A4',
+    landscape: raw.landscape ?? false,
+    folderId: raw.folderId ?? null,
+    tags: Array.isArray(raw.tags) ? raw.tags : [],
+    pinned: Boolean(raw.pinned),
+    trashedAt: raw.trashedAt ?? null,
+    pageIds: Array.isArray(raw.pageIds) ? raw.pageIds : [],
+    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    revision: typeof raw.revision === 'number' && raw.revision >= 1 ? raw.revision : 1,
+    paper: legacyPaper[paperRaw] ?? paperRaw,
+  };
+}
+
 export const repo = {
   async allNotebooks(): Promise<Notebook[]> {
-    const legacy: Record<string, string> = { black: '#000000', white: '#FFFFFF', cream: '#FFFDF0' };
-    return (await db.notebooks.toArray()).map((n) => ({
-      ...n,
-      paper: legacy[n.paper] ?? n.paper,
-      hasCover: n.hasCover ?? true,
-      template: n.template ?? 'blank',
-      size: n.size ?? 'A4',
-      landscape: n.landscape ?? false,
-    }));
+    return (await db.notebooks.toArray()).map((n) => normalizeLegacyNotebookRecord(n));
   },
   async getPages(notebookId: string): Promise<Page[]> {
     return db.pages.where('notebookId').equals(notebookId).toArray();
@@ -70,6 +103,23 @@ export const repo = {
   },
   async getTexts(pageId: string): Promise<TextBox[]> {
     return db.texts.where('pageId').equals(pageId).sortBy('order');
+  },
+  async getImages(pageId: string): Promise<ImageBox[]> {
+    return db.images.where('pageId').equals(pageId).sortBy('order');
+  },
+  async putImage(img: ImageBox, nbId: string): Promise<void> {
+    await db.transaction('rw', db.images, db.notebooks, async () => {
+      await db.images.put(img);
+      const nb = await db.notebooks.get(nbId);
+      if (nb) await db.notebooks.put({ ...nb, revision: nb.revision + 1, updatedAt: Date.now() });
+    });
+  },
+  async deleteImage(id: string, nbId: string): Promise<void> {
+    await db.transaction('rw', db.images, db.notebooks, async () => {
+      await db.images.delete(id);
+      const nb = await db.notebooks.get(nbId);
+      if (nb) await db.notebooks.put({ ...nb, revision: nb.revision + 1, updatedAt: Date.now() });
+    });
   },
   async putText(tb: TextBox, nbId: string): Promise<void> {
     await db.transaction('rw', db.texts, db.notebooks, async () => {
@@ -113,11 +163,12 @@ export const repo = {
     });
   },
   async deleteNotebook(id: string): Promise<void> {
-    await db.transaction('rw', db.notebooks, db.pages, db.layers, db.strokes, db.texts, async () => {
+    await db.transaction('rw', [db.notebooks, db.pages, db.layers, db.strokes, db.texts, db.images], async () => {
       const pages = await db.pages.where('notebookId').equals(id).toArray();
       for (const p of pages) {
         await db.strokes.where('pageId').equals(p.id).delete();
         await db.texts.where('pageId').equals(p.id).delete();
+        await db.images.where('pageId').equals(p.id).delete();
         await db.layers.where('pageId').equals(p.id).delete();
       }
       await db.pages.where('notebookId').equals(id).delete();
@@ -125,7 +176,16 @@ export const repo = {
     });
   },
   async updateNotebook(nb: Notebook): Promise<void> {
-    await db.notebooks.put(nb);
+    await db.transaction('rw', db.notebooks, async () => {
+      const existing = await db.notebooks.get(nb.id);
+      if (existing) {
+        // Revision & forward-compatibility guard: preserve any newer fields or higher revision
+        const nextRevision = Math.max(existing.revision ?? 1, nb.revision ?? 1);
+        await db.notebooks.put({ ...existing, ...nb, revision: nextRevision });
+      } else {
+        await db.notebooks.put(nb);
+      }
+    });
   },
   /** Atomic: stroke + notebook revision bump. Resolves only after the durable commit. */
   async addStroke(s: InkStroke, nbId: string): Promise<void> {

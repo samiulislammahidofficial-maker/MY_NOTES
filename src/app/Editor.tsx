@@ -20,6 +20,7 @@ import {
   Hand,
   HelpCircle,
   Highlighter,
+  Image as ImageIcon,
   KeyRound,
   Lasso,
   Layers,
@@ -44,10 +45,10 @@ import {
   ZoomIn,
 } from 'lucide-react';
 import katex from 'katex';
-import { actions, getActiveLayer, getLayers, getPages, getStrokes, getTexts, useApp } from './store';
+import { actions, beginEssentialJob, getActiveLayer, getImages, getLayers, getPages, getStrokes, getTexts, useApp } from './store';
 import { InkSurface } from '../engine/surface';
 import type { SelectionInfo, ShapeKind, ToolKind } from '../engine/tools';
-import { PAPER_COLORS, type InkStroke, type Page, type TextBox } from '../domain/types';
+import { PAPER_COLORS, type ImageBox, type InkStroke, type Page, type TextBox } from '../domain/types';
 import { unionBounds } from '../engine/hit';
 import { SwipeToAddController, type SwipeAddSnapshot } from '../engine/swipeAddPage';
 import { StyleColorPopover, type StylePopoverTab } from '../ui/StyleColorPopover';
@@ -61,6 +62,9 @@ import {
 import { segmentStrokesIntoLines } from '../recognition/segmentation';
 import { isDocumentUnlockedInSession } from '../security/passwordLock';
 import { PasswordModal, type PasswordModalMode } from '../ui/PasswordModal';
+import { blobStore, sha256Hex } from '../storage/blobStore';
+import { db } from '../storage/db';
+import { attachEditorSelectionGuard, clearWorkspaceStaleSelectionAndFocus } from '../engine/selectionGuard';
 
 const loadPdfManager = () => import('../pdf/pdfManager');
 const loadBackupManager = () => import('../export/backup');
@@ -360,6 +364,8 @@ function ContinuousPageCard({
   onSelectStrokesForConvert,
   onOpenTapBox,
   onAnyStrokeStart,
+  selectedImageId,
+  onSelectImage,
 }: {
   paneIndex: number;
   page: Page;
@@ -372,6 +378,8 @@ function ContinuousPageCard({
   onSelectStrokesForConvert: (page: Page, strokes: InkStroke[]) => void;
   onOpenTapBox: (page: Page, pt: { x: number; y: number }) => void;
   onAnyStrokeStart: () => void;
+  selectedImageId: string | null;
+  onSelectImage: (id: string | null) => void;
 }) {
   const version = useApp((s) => s.strokeVersion);
   const paper = useApp((s) => s.paper);
@@ -406,6 +414,10 @@ function ContinuousPageCard({
       getLayers: () => getLayers(page.id),
       activeLayerId: () => getActiveLayer(page.id),
       getTexts: () => getTexts(page.id),
+      getImages: () => getImages(page.id),
+      getSelectedImageId: () => (isActivePage ? selectedImageId : null),
+      onImageSelect: (im) => onSelectImage(im?.id ?? null),
+      onImageCommit: (prev, next) => actions.commitImageEdit(page.id, prev, next),
       onStroke: (st) => {
         setKeepMountedForStroke(false);
         actions.commitStroke(st);
@@ -541,9 +553,13 @@ function ContinuousPageCard({
 
 function Pane({
   index,
+  selectedImageId,
+  onSelectImage,
   onRequestUnlockPage,
 }: {
   index: number;
+  selectedImageId: string | null;
+  onSelectImage: (id: string | null) => void;
   onRequestUnlockPage: (page: Page) => void;
 }) {
   const pane = useApp((s) => s.panes[index]);
@@ -590,6 +606,10 @@ function Pane({
       getLayers: () => getLayers(pageOf() ?? ''),
       activeLayerId: () => getActiveLayer(pageOf() ?? ''),
       getTexts: () => getTexts(pageOf() ?? ''),
+      getImages: () => getImages(pageOf() ?? ''),
+      getSelectedImageId: () => (active ? selectedImageId : null),
+      onImageSelect: (im) => onSelectImage(im?.id ?? null),
+      onImageCommit: (prev, next) => actions.commitImageEdit(prev.pageId, prev, next),
       onStroke: (st) => actions.commitStroke(st),
       onEdit: (label, rm, add) => actions.commitEdit(label, rm, add),
       onActivate: () => actions.setActivePane(index),
@@ -632,6 +652,10 @@ function Pane({
       getLayers: () => getLayers(pageOf() ?? ''),
       activeLayerId: () => getActiveLayer(pageOf() ?? ''),
       getTexts: () => getTexts(pageOf() ?? ''),
+      getImages: () => getImages(pageOf() ?? ''),
+      getSelectedImageId: () => (active ? selectedImageId : null),
+      onImageSelect: (im) => onSelectImage(im?.id ?? null),
+      onImageCommit: (prev, next) => actions.commitImageEdit(prev.pageId, prev, next),
       onStroke: (st) => actions.commitStroke(st),
       onEdit: (label, rm, add) => actions.commitEdit(label, rm, add),
       onActivate: () => actions.setActivePane(index),
@@ -881,6 +905,8 @@ function Pane({
                       swipeCtrlRef.current.cancel();
                       setSwipeSnap(swipeCtrlRef.current.getSnapshot());
                     }}
+                    selectedImageId={selectedImageId}
+                    onSelectImage={onSelectImage}
                   />
                   {pageIdx < pages.length - 1 && (
                     <div className="page-boundary-bar" role="group" aria-label={`After page ${pageIdx + 1}`}>
@@ -1081,7 +1107,23 @@ function Pane({
         >
           <ZoomIn size={18} />
         </button>
-        <button className="icon sm" aria-label="Fit page" onClick={() => surf.current?.fit()}>
+        <button
+          className="icon sm"
+          aria-label="Zoom out"
+          title="Zoom out"
+          onClick={() => surf.current?.zoomByFactor(0.85)}
+        >
+          −
+        </button>
+        <button
+          className="icon sm"
+          aria-label="Zoom in"
+          title="Zoom in"
+          onClick={() => surf.current?.zoomByFactor(1.15)}
+        >
+          +
+        </button>
+        <button className="icon sm" aria-label="Fit page width" title="Fit page width" onClick={() => surf.current?.fit()}>
           <Maximize size={18} />
         </button>
       </div>
@@ -1240,6 +1282,21 @@ export function Editor() {
   } | null>(null);
   const [busyMsg, setBusyMsg] = useState<string | null>(null);
 
+  const editorRef = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!editorRef.current) return;
+    return attachEditorSelectionGuard(editorRef.current, () => useApp.getState().tool.kind);
+  }, []);
+
+  useEffect(() => {
+    if (editorRef.current) {
+      clearWorkspaceStaleSelectionAndFocus(editorRef.current, s.tool.kind);
+    }
+  }, [s.tool.kind]);
+
   useEffect(() => {
     const on = () => setWide(window.innerWidth >= 900);
     window.addEventListener('resize', on);
@@ -1270,6 +1327,168 @@ export function Editor() {
   const curPages = cur ? getPages(cur.notebookId) : [];
   const curPageIdx = curPages.findIndex((p) => p.id === cur?.pageId);
   const curPage = curPageIdx >= 0 ? curPages[curPageIdx] : undefined;
+
+  const allCurrentImages = curPage ? getImages(curPage.id) : [];
+  const selectedImage = selectedImageId ? allCurrentImages.find((im) => im.id === selectedImageId) ?? null : null;
+
+  const handleInsertImageFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+
+    if (!file.type.startsWith('image/') && !/\.(png|jpe?g|webp|gif|svg|bmp|avif)$/i.test(file.name)) {
+      alert('Please select a valid image file (PNG, JPEG, WebP, GIF, or SVG).');
+      return;
+    }
+
+    setBusyMsg('Importing image…');
+    const endJob = beginEssentialJob('image-import');
+    try {
+      const arrayBuf = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuf);
+      const sha256 = await sha256Hex(bytes);
+      const assetId = 'img-' + crypto.randomUUID();
+      const backend = await blobStore.put(assetId, bytes);
+
+      await db.assets.put({
+        id: assetId,
+        kind: 'image',
+        name: file.name,
+        mimeType: file.type || 'image/png',
+        size: file.size,
+        sha256,
+        backend,
+        createdAt: Date.now(),
+      });
+
+      // Decode natural dimensions
+      let naturalW = 400;
+      let naturalH = 300;
+      if (typeof createImageBitmap === 'function') {
+        try {
+          const bmp = await createImageBitmap(file);
+          naturalW = bmp.width;
+          naturalH = bmp.height;
+          bmp.close();
+        } catch {
+          /* fallback */
+        }
+      }
+
+      const aspectRatio = Math.max(0.05, naturalW / Math.max(1, naturalH));
+      const targetPage = curPage ?? curPages[0];
+      if (!targetPage) throw new Error('No active page to place image.');
+
+      const pW = targetPage.width;
+      const pH = targetPage.height;
+      const padX = 36;
+      let initW = Math.min(pW - padX * 2, 380);
+      let initH = initW / aspectRatio;
+      if (initH > pH * 0.5) {
+        initH = pH * 0.5;
+        initW = initH * aspectRatio;
+      }
+
+      const x0 = Math.max(0, (pW - initW) / 2);
+      const y0 = 60; // Placed toward top so user has writing room underneath!
+      const activeLayerId = getActiveLayer(targetPage.id) ?? targetPage.layerIds[0];
+
+      const newImg: ImageBox = {
+        kind: 'image',
+        id: crypto.randomUUID(),
+        pageId: targetPage.id,
+        layerId: activeLayerId,
+        assetId,
+        bounds: { x0, y0, x1: x0 + initW, y1: y0 + initH },
+        aspectRatio,
+        opacity: 1,
+        order: Date.now(),
+        revision: 1,
+      };
+
+      actions.commitImageEdit(targetPage.id, null, newImg);
+      setSelectedImageId(newImg.id);
+    } catch (err) {
+      alert(`Image import failed: ${(err as Error).message}`);
+    } finally {
+      endJob();
+      setBusyMsg(null);
+    }
+  };
+
+  const nudgeSelectedImage = (dx: number, dy: number) => {
+    if (!selectedImage || !curPage) return;
+    const w = selectedImage.bounds.x1 - selectedImage.bounds.x0;
+    const h = selectedImage.bounds.y1 - selectedImage.bounds.y0;
+    const nx0 = Math.max(0, Math.min(curPage.width - w, selectedImage.bounds.x0 + dx));
+    const ny0 = Math.max(0, Math.min(curPage.height - h, selectedImage.bounds.y0 + dy));
+    const next: ImageBox = {
+      ...selectedImage,
+      bounds: { x0: nx0, y0: ny0, x1: nx0 + w, y1: ny0 + h },
+      revision: selectedImage.revision + 1,
+    };
+    actions.commitImageEdit(curPage.id, selectedImage, next);
+  };
+
+  const scaleSelectedImage = (factor: number) => {
+    if (!selectedImage || !curPage) return;
+    const curW = selectedImage.bounds.x1 - selectedImage.bounds.x0;
+    const ar = selectedImage.aspectRatio || 1;
+    let newW = Math.max(60, Math.min(curPage.width, curW * factor));
+    let newH = newW / ar;
+    if (newH > curPage.height) {
+      newH = curPage.height;
+      newW = newH * ar;
+    }
+    let x0 = selectedImage.bounds.x0;
+    let y0 = selectedImage.bounds.y0;
+    if (x0 + newW > curPage.width) x0 = Math.max(0, curPage.width - newW);
+    if (y0 + newH > curPage.height) y0 = Math.max(0, curPage.height - newH);
+
+    const next: ImageBox = {
+      ...selectedImage,
+      bounds: { x0, y0, x1: x0 + newW, y1: y0 + newH },
+      revision: selectedImage.revision + 1,
+    };
+    actions.commitImageEdit(curPage.id, selectedImage, next);
+  };
+
+  const fitSelectedImageWidth = () => {
+    if (!selectedImage || !curPage) return;
+    const pad = 36;
+    const newW = Math.max(100, curPage.width - pad * 2);
+    const ar = selectedImage.aspectRatio || 1;
+    let newH = newW / ar;
+    if (newH > curPage.height - 72) {
+      newH = curPage.height - 72;
+    }
+    const x0 = pad;
+    const y0 = Math.max(20, Math.min(curPage.height - newH - 20, selectedImage.bounds.y0));
+    const next: ImageBox = {
+      ...selectedImage,
+      bounds: { x0, y0, x1: x0 + newW, y1: y0 + newH },
+      revision: selectedImage.revision + 1,
+    };
+    actions.commitImageEdit(curPage.id, selectedImage, next);
+  };
+
+  const cycleSelectedImageOpacity = () => {
+    if (!selectedImage || !curPage) return;
+    const curOp = selectedImage.opacity ?? 1;
+    const nextOp = curOp > 0.8 ? 0.65 : curOp > 0.5 ? 0.35 : 1;
+    const next: ImageBox = {
+      ...selectedImage,
+      opacity: nextOp,
+      revision: selectedImage.revision + 1,
+    };
+    actions.commitImageEdit(curPage.id, selectedImage, next);
+  };
+
+  const deleteSelectedImage = () => {
+    if (!selectedImage || !curPage) return;
+    actions.commitImageEdit(curPage.id, selectedImage, null);
+    setSelectedImageId(null);
+  };
 
   const saveLabel = { idle: '', saving: 'Saving…', saved: 'Saved locally', failed: 'Save failed' }[s.save];
   const kind = s.tool.kind;
@@ -1303,6 +1522,7 @@ export function Editor() {
     if (!curNb) return;
     setPop(null);
     setBusyMsg('Exporting vector PDF…');
+    const endJob = beginEssentialJob('pdf-export');
     try {
       const [{ exportNotebookToPdfBytes }, { saveOrShareFileBytes }] = await Promise.all([
         loadPdfManager(),
@@ -1314,11 +1534,13 @@ export function Editor() {
         (pid) => getStrokes(pid),
         (pid) => getTexts(pid),
         (pid) => getLayers(pid),
+        (pid) => getImages(pid),
       );
       await saveOrShareFileBytes(bytes, `${curNb.title || 'Notebook'}.pdf`, 'application/pdf');
     } catch (err) {
       alert(`PDF export failed: ${(err as Error).message}`);
     } finally {
+      endJob();
       setBusyMsg(null);
     }
   };
@@ -1339,7 +1561,7 @@ export function Editor() {
   };
 
   return (
-    <div className="editor">
+    <div className="editor" ref={editorRef}>
       <header className="ed-head">
         <button className="icon blue" aria-label="Back to library" onClick={actions.closeEditor}>
           <ChevronLeft size={26} />
@@ -1639,6 +1861,16 @@ export function Editor() {
 
           <hr style={{ border: 0, borderTop: '1px solid var(--line)', margin: '6px 0' }} />
 
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
+              imageInputRef.current?.click();
+            }}
+          >
+            <ImageIcon size={16} /> <span>Insert Image</span>
+          </button>
           <button role="menuitem" className="nav-row" onClick={() => void handleExportPdf()}>
             <FileDown size={16} /> <span>Export as PDF</span>
           </button>
@@ -1686,6 +1918,21 @@ export function Editor() {
           {tbtn('eraser', 'Eraser', <Eraser size={22} />, 'eraser')}
           {tbtn('lasso', 'Lasso', <Lasso size={22} />)}
           {tbtn('text', 'Text box & Scribble', <Type size={22} />)}
+          <button
+            className="tool"
+            aria-label="Insert image"
+            title="Insert image (question photo, diagram, scan)"
+            onClick={() => imageInputRef.current?.click()}
+          >
+            <ImageIcon size={22} />
+          </button>
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={handleInsertImageFile}
+          />
           {tbtn('hand', 'Hand (pan)', <Hand size={22} />)}
           {tbtn('laser', 'Laser pointer', <Sparkles size={22} />)}
           {tbtn('shape', 'Shapes', <Shapes size={22} />, 'shape')}
@@ -1815,6 +2062,8 @@ export function Editor() {
             <div key={i} className="pane-wrap" style={{ display: panesToShow.includes(i) ? 'flex' : 'none' }}>
               <Pane
                 index={i}
+                selectedImageId={selectedImageId}
+                onSelectImage={setSelectedImageId}
                 onRequestUnlockPage={(pg) =>
                   setPwModal({
                     mode: 'unlock',
@@ -1927,6 +2176,95 @@ export function Editor() {
             }
           }}
         />
+      )}
+
+      {selectedImage && (
+        <div
+          className="sel-menu image-toolbar"
+          role="toolbar"
+          aria-label="Image actions"
+          style={{
+            position: 'fixed',
+            bottom: 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 40,
+            background: 'rgba(28, 28, 30, 0.94)',
+            backdropFilter: 'blur(16px)',
+            border: '1px solid var(--line)',
+            borderRadius: 14,
+            padding: '6px 12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+          }}
+        >
+          <span
+            style={{
+              fontSize: 12,
+              color: 'var(--muted)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              marginRight: 4,
+            }}
+          >
+            <ImageIcon size={15} /> Question Image
+          </span>
+          <div style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }} title="Nudge position">
+            <button className="icon xs" aria-label="Nudge left" onClick={() => nudgeSelectedImage(-20, 0)}>
+              <ArrowLeft size={14} />
+            </button>
+            <button className="icon xs" aria-label="Nudge right" onClick={() => nudgeSelectedImage(20, 0)}>
+              <ArrowRight size={14} />
+            </button>
+            <button className="icon xs" aria-label="Nudge up" onClick={() => nudgeSelectedImage(0, -20)}>
+              <ArrowUp size={14} />
+            </button>
+            <button className="icon xs" aria-label="Nudge down" onClick={() => nudgeSelectedImage(0, 20)}>
+              <ArrowDown size={14} />
+            </button>
+          </div>
+          <span style={{ width: 1, height: 16, background: 'var(--line)' }} />
+          <div style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+            <button className="chip" aria-label="Shrink 10%" onClick={() => scaleSelectedImage(0.9)} title="Shrink image">
+              − 10%
+            </button>
+            <button className="chip" aria-label="Enlarge 10%" onClick={() => scaleSelectedImage(1.1)} title="Enlarge image">
+              + 10%
+            </button>
+            <button className="chip" aria-label="Fit Page Width" onClick={() => fitSelectedImageWidth()} title="Fit Page Width">
+              Fit Width
+            </button>
+          </div>
+          <span style={{ width: 1, height: 16, background: 'var(--line)' }} />
+          <button
+            className="chip"
+            onClick={() => cycleSelectedImageOpacity()}
+            title="Toggle opacity (100% / 65% / 35%) for tracing over diagrams"
+          >
+            Opacity {Math.round((selectedImage.opacity ?? 1) * 100)}%
+          </button>
+          <span style={{ width: 1, height: 16, background: 'var(--line)' }} />
+          <button
+            className="icon xs"
+            style={{ color: '#FF453A' }}
+            aria-label="Delete image"
+            title="Delete image"
+            onClick={() => deleteSelectedImage()}
+          >
+            <Trash2 size={16} />
+          </button>
+          <button
+            className="icon xs"
+            aria-label="Deselect image"
+            title="Done"
+            onClick={() => setSelectedImageId(null)}
+          >
+            <X size={16} />
+          </button>
+        </div>
       )}
     </div>
   );

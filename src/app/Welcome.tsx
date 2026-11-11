@@ -68,6 +68,7 @@ export function Welcome() {
   const [platformTab, setPlatformTab] = useState<'ios' | 'android'>('ios');
   const [videoError, setVideoError] = useState(false);
   const [videoReloadKey, setVideoReloadKey] = useState(0);
+  const [videoDuration, setVideoDuration] = useState('~1m 24s');
   const [offlineState, setOfflineState] = useState<'idle' | 'downloading' | 'ready' | 'error'>('idle');
   const [offlineProgress, setOfflineProgress] = useState(0);
   const [offlineSizeKb, setOfflineSizeKb] = useState<number | null>(null);
@@ -220,6 +221,14 @@ export function Welcome() {
                 aria-label="My Notes tutorial walkthrough video"
                 onError={() => setVideoError(true)}
                 onLoadedData={() => setVideoError(false)}
+                onLoadedMetadata={(e) => {
+                  const dur = e.currentTarget.duration;
+                  if (dur && Number.isFinite(dur)) {
+                    const mins = Math.floor(dur / 60);
+                    const secs = Math.floor(dur % 60);
+                    setVideoDuration(`${mins}m ${secs.toString().padStart(2, '0')}s`);
+                  }
+                }}
               >
                 <source src="/tutorial/my-notes-tutorial.mp4" type="video/mp4" />
                 <track
@@ -255,7 +264,7 @@ export function Welcome() {
 
             <div className="welcome-video-bar">
               <div className="welcome-video-meta">
-                <span>Duration: ~1m 24s • Captions: English &amp; বাংলা</span>
+                <span>Duration: {videoDuration} • Captions: English &amp; বাংলা</span>
                 {offlineSizeKb && <span> • Local cache size: {offlineSizeKb} KB</span>}
               </div>
               <div className="welcome-video-actions">

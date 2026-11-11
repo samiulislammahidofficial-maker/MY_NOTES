@@ -1,4 +1,4 @@
-import type { InkStroke, Notebook, Page, PasswordEnvelope, TextBox } from '../domain/types';
+import type { ImageBox, InkStroke, Notebook, Page, PasswordEnvelope, TextBox } from '../domain/types';
 import { db, repo } from '../storage/db';
 
 const PBKDF2_ITERATIONS = 120_000;
@@ -7,11 +7,13 @@ export interface EncryptedPagePayload {
   version: 1;
   strokes: Array<Omit<InkStroke, 'samples'> & { samples: number[] }>;
   texts: TextBox[];
+  images?: ImageBox[];
 }
 
 export interface EncryptedNotebookPayload {
   version: 1;
   pages: Record<string, EncryptedPagePayload>;
+  pageOrder?: string[];
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -126,26 +128,31 @@ export async function lockNotebookAtRest(
   password: string,
   inMemoryStrokesByPage?: Record<string, InkStroke[]>,
   inMemoryTextsByPage?: Record<string, TextBox[]>,
+  inMemoryImagesByPage?: Record<string, ImageBox[]>,
 ): Promise<PasswordEnvelope> {
   const pages = await repo.getPages(notebook.id);
-  const payload: EncryptedNotebookPayload = { version: 1, pages: {} };
+  const orderedIds = notebook.pageIds?.length ? notebook.pageIds : pages.map((p) => p.id);
+  const payload: EncryptedNotebookPayload = { version: 1, pages: {}, pageOrder: orderedIds };
 
   for (const p of pages) {
     const strokes = inMemoryStrokesByPage?.[p.id] ?? (await repo.getStrokes(p.id));
     const texts = inMemoryTextsByPage?.[p.id] ?? (await repo.getTexts(p.id));
+    const images = inMemoryImagesByPage?.[p.id] ?? (await repo.getImages(p.id));
     payload.pages[p.id] = {
       version: 1,
       strokes: serializeStrokes(strokes),
       texts,
+      images,
     };
   }
 
   const envelope = await encryptJsonPayload(password, payload);
 
-  await db.transaction('rw', [db.notebooks, db.strokes, db.texts], async () => {
+  await db.transaction('rw', [db.notebooks, db.strokes, db.texts, db.images], async () => {
     for (const p of pages) {
       await db.strokes.where('pageId').equals(p.id).delete();
       await db.texts.where('pageId').equals(p.id).delete();
+      await db.images.where('pageId').equals(p.id).delete();
     }
     await db.notebooks.update(notebook.id, {
       passwordLock: envelope,
@@ -157,7 +164,7 @@ export async function lockNotebookAtRest(
 }
 
 /**
- * Verifies the password for a protected notebook, decrypts its pages' strokes and texts
+ * Verifies the password for a protected notebook, decrypts its pages' strokes, texts and images
  * into memory, and marks it unlocked in the current session.
  */
 export async function unlockNotebookToMemory(
@@ -166,6 +173,7 @@ export async function unlockNotebookToMemory(
 ): Promise<{
   strokesByPage: Record<string, InkStroke[]>;
   textsByPage: Record<string, TextBox[]>;
+  imagesByPage: Record<string, ImageBox[]>;
 }> {
   if (!notebook.passwordLock) {
     throw new Error('This notebook does not have a password set.');
@@ -173,28 +181,53 @@ export async function unlockNotebookToMemory(
   const payload = await decryptJsonPayload<EncryptedNotebookPayload>(password, notebook.passwordLock);
   const strokesByPage: Record<string, InkStroke[]> = {};
   const textsByPage: Record<string, TextBox[]> = {};
+  const imagesByPage: Record<string, ImageBox[]> = {};
 
-  for (const [pageId, pageData] of Object.entries(payload.pages)) {
-    strokesByPage[pageId] = deserializeStrokes(pageData.strokes ?? []);
-    textsByPage[pageId] = pageData.texts ?? [];
+  const entries = Object.entries(payload.pages);
+  const targetPageIds = notebook.pageIds ?? [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const [origPageId, pageData] = entries[i];
+    // If notebook was restored with remapped pageIds, map by pageOrder index or fallback to origPageId
+    const mappedPageId =
+      payload.pages[origPageId] && targetPageIds.includes(origPageId)
+        ? origPageId
+        : payload.pageOrder
+          ? targetPageIds[payload.pageOrder.indexOf(origPageId)] ?? targetPageIds[i] ?? origPageId
+          : targetPageIds[i] ?? origPageId;
+
+    strokesByPage[mappedPageId] = deserializeStrokes(pageData.strokes ?? []).map((s) => ({
+      ...s,
+      pageId: mappedPageId,
+    }));
+    textsByPage[mappedPageId] = (pageData.texts ?? []).map((tb) => ({
+      ...tb,
+      pageId: mappedPageId,
+    }));
+    imagesByPage[mappedPageId] = (pageData.images ?? []).map((img) => ({
+      ...img,
+      pageId: mappedPageId,
+    }));
   }
 
   sessionPasswords.set(notebook.id, password);
-  return { strokesByPage, textsByPage };
+  return { strokesByPage, textsByPage, imagesByPage };
 }
 
 /**
  * Removes password protection from a notebook after verifying the current password,
- * restoring decrypted strokes and texts back to IndexedDB.
+ * restoring decrypted strokes, texts and images back to IndexedDB.
  */
 export async function removeNotebookPassword(
   notebook: Notebook,
   currentPassword: string,
   inMemoryStrokesByPage?: Record<string, InkStroke[]>,
   inMemoryTextsByPage?: Record<string, TextBox[]>,
+  inMemoryImagesByPage?: Record<string, ImageBox[]>,
 ): Promise<{
   strokesByPage: Record<string, InkStroke[]>;
   textsByPage: Record<string, TextBox[]>;
+  imagesByPage: Record<string, ImageBox[]>;
 }> {
   if (!notebook.passwordLock) {
     throw new Error('This notebook does not have a password set.');
@@ -202,22 +235,27 @@ export async function removeNotebookPassword(
   const decrypted = await decryptJsonPayload<EncryptedNotebookPayload>(currentPassword, notebook.passwordLock);
   const strokesByPage: Record<string, InkStroke[]> = {};
   const textsByPage: Record<string, TextBox[]> = {};
+  const imagesByPage: Record<string, ImageBox[]> = {};
 
   const pages = await repo.getPages(notebook.id);
   for (const p of pages) {
     const pageData = decrypted.pages[p.id];
     strokesByPage[p.id] = inMemoryStrokesByPage?.[p.id] ?? (pageData ? deserializeStrokes(pageData.strokes) : []);
     textsByPage[p.id] = inMemoryTextsByPage?.[p.id] ?? (pageData ? pageData.texts : []);
+    imagesByPage[p.id] = inMemoryImagesByPage?.[p.id] ?? (pageData ? pageData.images ?? [] : []);
   }
 
-  await db.transaction('rw', [db.notebooks, db.strokes, db.texts], async () => {
+  await db.transaction('rw', [db.notebooks, db.strokes, db.texts, db.images], async () => {
     for (const p of pages) {
       await db.strokes.where('pageId').equals(p.id).delete();
       await db.texts.where('pageId').equals(p.id).delete();
+      await db.images.where('pageId').equals(p.id).delete();
       const s = strokesByPage[p.id] ?? [];
       const t = textsByPage[p.id] ?? [];
+      const im = imagesByPage[p.id] ?? [];
       if (s.length) await db.strokes.bulkPut(s as never);
       if (t.length) await db.texts.bulkPut(t);
+      if (im.length) await db.images.bulkPut(im);
     }
     await db.notebooks.update(notebook.id, {
       passwordLock: null,
@@ -226,7 +264,7 @@ export async function removeNotebookPassword(
   });
 
   sessionPasswords.delete(notebook.id);
-  return { strokesByPage, textsByPage };
+  return { strokesByPage, textsByPage, imagesByPage };
 }
 
 /**
@@ -237,16 +275,19 @@ export async function lockPageAtRest(
   password: string,
   strokes: InkStroke[],
   texts: TextBox[],
+  images?: ImageBox[],
 ): Promise<PasswordEnvelope> {
   const payload: EncryptedPagePayload = {
     version: 1,
     strokes: serializeStrokes(strokes),
     texts,
+    images: images ?? [],
   };
   const envelope = await encryptJsonPayload(password, payload);
-  await db.transaction('rw', [db.pages, db.strokes, db.texts], async () => {
+  await db.transaction('rw', [db.pages, db.strokes, db.texts, db.images], async () => {
     await db.strokes.where('pageId').equals(page.id).delete();
     await db.texts.where('pageId').equals(page.id).delete();
+    await db.images.where('pageId').equals(page.id).delete();
     await db.pages.update(page.id, { passwordLock: envelope });
   });
   return envelope;
@@ -255,7 +296,7 @@ export async function lockPageAtRest(
 export async function unlockPageToMemory(
   page: Page,
   password: string,
-): Promise<{ strokes: InkStroke[]; texts: TextBox[] }> {
+): Promise<{ strokes: InkStroke[]; texts: TextBox[]; images: ImageBox[] }> {
   if (!page.passwordLock) {
     throw new Error('This page does not have a password set.');
   }
@@ -264,6 +305,7 @@ export async function unlockPageToMemory(
   return {
     strokes: deserializeStrokes(payload.strokes ?? []),
     texts: payload.texts ?? [],
+    images: payload.images ?? [],
   };
 }
 
@@ -272,21 +314,25 @@ export async function removePagePassword(
   currentPassword: string,
   inMemoryStrokes?: InkStroke[],
   inMemoryTexts?: TextBox[],
-): Promise<{ strokes: InkStroke[]; texts: TextBox[] }> {
+  inMemoryImages?: ImageBox[],
+): Promise<{ strokes: InkStroke[]; texts: TextBox[]; images: ImageBox[] }> {
   if (!page.passwordLock) {
     throw new Error('This page does not have a password set.');
   }
   const payload = await decryptJsonPayload<EncryptedPagePayload>(currentPassword, page.passwordLock);
   const strokes = inMemoryStrokes ?? deserializeStrokes(payload.strokes ?? []);
   const texts = inMemoryTexts ?? (payload.texts ?? []);
+  const images = inMemoryImages ?? (payload.images ?? []);
 
-  await db.transaction('rw', [db.pages, db.strokes, db.texts], async () => {
+  await db.transaction('rw', [db.pages, db.strokes, db.texts, db.images], async () => {
     await db.strokes.where('pageId').equals(page.id).delete();
     await db.texts.where('pageId').equals(page.id).delete();
+    await db.images.where('pageId').equals(page.id).delete();
     if (strokes.length) await db.strokes.bulkPut(strokes as never);
     if (texts.length) await db.texts.bulkPut(texts);
+    if (images.length) await db.images.bulkPut(images);
     await db.pages.update(page.id, { passwordLock: null });
   });
   sessionPasswords.delete(page.id);
-  return { strokes, texts };
+  return { strokes, texts, images };
 }

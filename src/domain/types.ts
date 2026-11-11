@@ -136,6 +136,19 @@ export interface TextBox {
   revision: number;
 }
 
+export interface ImageBox {
+  kind: 'image';
+  id: string;
+  pageId: string;
+  layerId: string;
+  assetId: string;
+  bounds: { x0: number; y0: number; x1: number; y1: number };
+  aspectRatio: number;
+  opacity: number;
+  order: number;
+  revision: number;
+}
+
 export interface AssetRecord {
   id: string;
   kind: 'pdf' | 'font' | 'image';

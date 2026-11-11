@@ -1,6 +1,14 @@
+import 'fake-indexeddb/auto';
 import { describe, expect, it } from 'vitest';
+import { indexedDB, IDBKeyRange } from 'fake-indexeddb';
+import Dexie from 'dexie';
+
+Dexie.dependencies.indexedDB = indexedDB;
+Dexie.dependencies.IDBKeyRange = IDBKeyRange;
 import { clientToDoc, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
-import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, type StrokeTarget } from '../src/domain/history';
+import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, UpdateImageBoxCommand, deserializeCommand, type StrokeTarget } from '../src/domain/history';
+import { isDrawingOrManipulationTool, isAllowedTextSelectionTarget } from '../src/engine/selectionGuard';
+import type { ImageBox } from '../src/domain/types';
 import { SampleBuffer, arbitrate, expandEvents, resolvePressure } from '../src/engine/input';
 import {
   eraseCircle,
@@ -445,3 +453,335 @@ describe('durable local save tracking, quota failure recovery, and safe update s
     expect(dirty.size).toBe(0);
   });
 });
+
+import { strFromU8, unzipSync } from 'fflate';
+import {
+  checkStorageProtection,
+  checkStorageProtectionOnResume,
+  formatApproxBytes,
+  requestStorageProtection,
+  resetStorageProtectionStateForTests,
+} from '../src/storage/persistence';
+import { normalizeLegacyNotebookRecord, repo } from '../src/storage/db';
+import { buildBackupZipBytes, restoreFromBackupZipBytes } from '../src/export/backup';
+import { lockNotebookAtRest, unlockNotebookToMemory } from '../src/security/passwordLock';
+import { checkForServiceWorkerUpdates, shouldAllowControlledReload } from '../src/ui/SafeUpdateBanner';
+
+describe('browser storage protection states (granted, not-granted, unsupported, check-failed, checking)', () => {
+  it('distinguishes checking, granted, not-granted, unsupported, and check-failed without faking permission', async () => {
+    resetStorageProtectionStateForTests();
+
+    // 1. Unsupported when storage API is missing
+    const sUnsupported = await checkStorageProtection(undefined);
+    expect(sUnsupported.status).toBe('unsupported');
+    expect(sUnsupported.estimate.supported).toBe(false);
+
+    // 2. Not-granted when persisted() returns false
+    const sNotGranted = await checkStorageProtection({
+      persisted: async () => false,
+      estimate: async () => ({ usage: 2 * 1024 * 1024, quota: 500 * 1024 * 1024 }),
+    });
+    expect(sNotGranted.status).toBe('not-granted');
+    expect(sNotGranted.estimate.usageBytes).toBe(2 * 1024 * 1024);
+    expect(formatApproxBytes(sNotGranted.estimate.usageBytes)).toBe('2.0 MB');
+
+    // 3. Exception thrown by persisted() is labeled check-failed (never permission denied / not-granted)
+    const sFailed = await checkStorageProtection({
+      persisted: async () => {
+        throw new Error('SecurityError: Storage disabled');
+      },
+    });
+    expect(sFailed.status).toBe('check-failed');
+    expect(sFailed.errorMessage).toContain('SecurityError');
+
+    // 4. Granted when persisted() returns true
+    const sGranted = await checkStorageProtection({
+      persisted: async () => true,
+    });
+    expect(sGranted.status).toBe('granted');
+  });
+
+  it('handles user-triggered requestStorageProtection (persist() -> recheck persisted()), deduplicates concurrent requests, and debounces resume checks', async () => {
+    resetStorageProtectionStateForTests();
+    let persistCalls = 0;
+    let stateGranted = false;
+
+    const mockStorage = {
+      persisted: async () => stateGranted,
+      persist: async () => {
+        persistCalls++;
+        await new Promise((r) => setTimeout(r, 15));
+        stateGranted = true;
+        return true;
+      },
+      estimate: async () => ({ usage: 1024, quota: 10240 }),
+    };
+
+    // Concurrent calls should deduplicate into a single persist() call
+    const [r1, r2] = await Promise.all([
+      requestStorageProtection(mockStorage),
+      requestStorageProtection(mockStorage),
+    ]);
+    expect(persistCalls).toBe(1);
+    expect(r1.status).toBe('granted');
+    expect(r2.status).toBe('granted');
+
+    // When persist() returns false, status remains 'not-granted' (never faked)
+    stateGranted = false;
+    const denied = await requestStorageProtection({
+      persisted: async () => false,
+      persist: async () => false,
+    });
+    expect(denied.status).toBe('not-granted');
+
+    // When persist() throws, status is 'check-failed'
+    const threw = await requestStorageProtection({
+      persisted: async () => false,
+      persist: async () => {
+        throw new Error('AbortError');
+      },
+    });
+    expect(threw.status).toBe('check-failed');
+
+    // Debounced resume check avoids redundant calls within interval
+    let resumeChecks = 0;
+    const resumeStorage = {
+      persisted: async () => {
+        resumeChecks++;
+        return false;
+      },
+    };
+    await checkStorageProtectionOnResume(60_000, resumeStorage);
+    await checkStorageProtectionOnResume(60_000, resumeStorage);
+    expect(resumeChecks).toBe(1);
+  });
+});
+
+describe('versioned backup/restore with encrypted passwordLock & legacy migration safety', () => {
+  it('preserves notes when persist() is false, exports ciphertext without leaking keys, and restores non-destructively', async () => {
+    const nbId = crypto.randomUUID();
+    const pageId = crypto.randomUUID();
+    const layerId = crypto.randomUUID();
+    const now = Date.now();
+
+    const nb = {
+      id: nbId,
+      title: 'Protected Engineering Notes',
+      cover: '#385E51',
+      hasCover: true,
+      template: 'ruled' as const,
+      size: 'A4' as const,
+      landscape: false,
+      folderId: null,
+      tags: ['test'],
+      pinned: true,
+      trashedAt: null,
+      pageIds: [pageId],
+      createdAt: now,
+      updatedAt: now,
+      revision: 3,
+      paper: '#000000',
+    };
+    const page = { id: pageId, notebookId: nbId, width: 595.28, height: 841.89, layerIds: [layerId], revision: 1 };
+    const layer = { id: layerId, pageId, name: 'Ink', visible: true, locked: false, opacity: 1 };
+    await repo.createNotebook(nb, page, layer);
+
+    const stroke = mkLineStroke(crypto.randomUUID(), 20, 30, 120, 80, 10);
+    stroke.pageId = pageId;
+    stroke.layerId = layerId;
+    await repo.addStroke(stroke, nbId);
+
+    // Lock notebook with password -> plaintext strokes wiped from IndexedDB, stored as AES-GCM envelope
+    const secretPw = 'MySafeTabletPass!99';
+    const env = await lockNotebookAtRest(nb, secretPw);
+    expect(await repo.getStrokes(pageId)).toHaveLength(0);
+
+    // Build backup zip bytes and verify password is never leaked in archive
+    const zipBytes = await buildBackupZipBytes(nbId);
+    const unzipped = unzipSync(zipBytes);
+    const dataJsonText = strFromU8(unzipped['data.json']);
+    expect(dataJsonText).not.toContain(secretPw);
+    expect(dataJsonText).toContain(env.ciphertextB64.slice(0, 16));
+
+    // Restore while original notebook still exists -> remaps ID without clobbering original
+    const res = await restoreFromBackupZipBytes(zipBytes);
+    expect(res.restoredNotebooks).toBe(1);
+
+    const all = await repo.allNotebooks();
+    const restored = all.find((x) => x.id !== nbId && x.title.includes('Protected Engineering Notes'));
+    expect(restored).toBeDefined();
+    expect(restored?.passwordLock?.ciphertextB64).toBe(env.ciphertextB64);
+
+    // Verify restored notebook unlocks with the original password and recovers the exact stroke on the restored pageId
+    const unlocked = await unlockNotebookToMemory(restored!, secretPw);
+    const restoredPageId = restored!.pageIds[0];
+    expect(unlocked.strokesByPage[restoredPageId]).toHaveLength(1);
+    expect(unlocked.strokesByPage[restoredPageId][0].pageId).toBe(restoredPageId);
+  });
+
+  it('normalizes legacy v1 notebook records and preserves newer revision/fields during rollbacks', async () => {
+    const normalized = normalizeLegacyNotebookRecord({
+      id: 'legacy-1',
+      title: 'Old V1 Note',
+      paper: 'cream',
+    });
+    expect(normalized.paper).toBe('#FFFDF0');
+    expect(normalized.template).toBe('blank');
+    expect(normalized.size).toBe('A4');
+    expect(normalized.revision).toBe(1);
+  });
+});
+
+describe('service worker update check states and reload loop guard', () => {
+  it('reports available, up-to-date, and offline-or-error accurately without claiming success on network failure', async () => {
+    // 1. Failing update() network request -> 'offline-or-error'
+    const errRes = await checkForServiceWorkerUpdates({
+      userInitiated: true,
+      regOverride: {
+        waiting: null,
+        installing: null,
+        update: async () => {
+          throw new Error('NetworkError when attempting to fetch resource');
+        },
+      } as unknown as ServiceWorkerRegistration,
+    });
+    expect(errRes).toBe('offline-or-error');
+
+    // 2. Successful update() with no waiting worker -> 'up-to-date'
+    const upToDate = await checkForServiceWorkerUpdates({
+      userInitiated: true,
+      regOverride: {
+        waiting: null,
+        installing: null,
+        update: async () => undefined,
+      } as unknown as ServiceWorkerRegistration,
+    });
+    expect(upToDate).toBe('up-to-date');
+
+    // 3. Waiting worker present -> 'available'
+    const available = await checkForServiceWorkerUpdates({
+      userInitiated: true,
+      regOverride: {
+        waiting: { state: 'installed' },
+        installing: null,
+        update: async () => undefined,
+      } as unknown as ServiceWorkerRegistration,
+    });
+    expect(available).toBe('available');
+
+    // 4. Reload loop guard allows first reload and blocks immediate second reload within 10s
+    expect(shouldAllowControlledReload(100_000)).toBe(true);
+    expect(shouldAllowControlledReload(102_000)).toBe(false);
+    expect(shouldAllowControlledReload(115_000)).toBe(true);
+  });
+});
+
+describe('image insertion, manipulation, undo/redo, and selection protection', () => {
+  const dummyTarget: StrokeTarget = {
+    addStroke: () => {},
+    removeStroke: () => {},
+    replace: () => {},
+    addImage: (img) => {
+      images.set(img.id, img);
+    },
+    removeImage: (_pageId, id) => {
+      images.delete(id);
+    },
+  };
+  const images = new Map<string, ImageBox>();
+
+  it('correctly executes insert, update (move/resize), and delete with undo/redo', () => {
+    images.clear();
+    const h = new History(200);
+    const img1: ImageBox = {
+      kind: 'image',
+      id: 'img-1',
+      pageId: 'page-1',
+      layerId: 'layer-1',
+      assetId: 'asset-img-1',
+      bounds: { x0: 36, y0: 60, x1: 396, y1: 330 },
+      aspectRatio: 4 / 3,
+      opacity: 1,
+      order: 100,
+      revision: 1,
+    };
+
+    // 1. Insert image
+    h.run(new UpdateImageBoxCommand('page-1', null, img1), dummyTarget);
+    expect(images.get('img-1')).toEqual(img1);
+    expect(h.canUndo).toBe(true);
+
+    // 2. Undo insert
+    h.undo(dummyTarget);
+    expect(images.has('img-1')).toBe(false);
+
+    // 3. Redo insert
+    h.redo(dummyTarget);
+    expect(images.get('img-1')).toEqual(img1);
+
+    // 4. Move/resize image
+    const img1Moved: ImageBox = {
+      ...img1,
+      bounds: { x0: 50, y0: 80, x1: 450, y1: 380 },
+      revision: 2,
+    };
+    h.run(new UpdateImageBoxCommand('page-1', img1, img1Moved), dummyTarget);
+    expect(images.get('img-1')?.bounds).toEqual({ x0: 50, y0: 80, x1: 450, y1: 380 });
+
+    // 5. Undo move
+    h.undo(dummyTarget);
+    expect(images.get('img-1')?.bounds).toEqual({ x0: 36, y0: 60, x1: 396, y1: 330 });
+
+    // 6. Delete image
+    h.redo(dummyTarget); // back to img1Moved
+    h.run(new UpdateImageBoxCommand('page-1', img1Moved, null), dummyTarget);
+    expect(images.has('img-1')).toBe(false);
+
+    // 7. Undo delete restores image
+    h.undo(dummyTarget);
+    expect(images.get('img-1')).toEqual(img1Moved);
+  });
+
+  it('serializes and roundtrip deserializes UpdateImageBoxCommand', () => {
+    const img: ImageBox = {
+      kind: 'image',
+      id: 'img-serial',
+      pageId: 'page-1',
+      layerId: 'layer-1',
+      assetId: 'asset-1',
+      bounds: { x0: 10, y0: 20, x1: 210, y1: 170 },
+      aspectRatio: 4 / 3,
+      opacity: 0.8,
+      order: 500,
+      revision: 1,
+    };
+    const cmd = new UpdateImageBoxCommand('page-1', null, img);
+    const serialized = cmd.serialize();
+    expect(serialized.kind).toBe('update-image');
+
+    const revived = deserializeCommand(serialized);
+    expect(revived).toBeInstanceOf(UpdateImageBoxCommand);
+  });
+
+  it('guarantees selection guard identifies drawing tools and non-allowed text targets', () => {
+    expect(isDrawingOrManipulationTool('pen')).toBe(true);
+    expect(isDrawingOrManipulationTool('highlighter')).toBe(true);
+    expect(isDrawingOrManipulationTool('eraser')).toBe(true);
+    expect(isDrawingOrManipulationTool('lasso')).toBe(true);
+    expect(isDrawingOrManipulationTool('hand')).toBe(true);
+    expect(isDrawingOrManipulationTool('laser')).toBe(true);
+    expect(isDrawingOrManipulationTool('shape')).toBe(true);
+    expect(isDrawingOrManipulationTool('text')).toBe(false);
+
+    const div = { nodeType: 1, tagName: 'DIV' } as unknown as Node;
+    expect(isAllowedTextSelectionTarget(div)).toBe(false);
+
+    const input = { nodeType: 1, tagName: 'INPUT', type: 'text' } as unknown as Node;
+    expect(isAllowedTextSelectionTarget(input)).toBe(true);
+
+    const rangeInput = { nodeType: 1, tagName: 'INPUT', type: 'range' } as unknown as Node;
+    expect(isAllowedTextSelectionTarget(rangeInput)).toBe(false);
+  });
+});
+
+

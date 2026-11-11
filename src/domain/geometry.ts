@@ -44,3 +44,20 @@ export function fitPage(
   const s = clampScale(Math.min((viewW - margin * 2) / pageW, (viewH - margin * 2) / pageH));
   return { scale: s, tx: (viewW - pageW * s) / 2, ty: (viewH - pageH * s) / 2 };
 }
+
+/**
+ * Default Fit Width view matrix: scales the page to fill the pane width with a modest gutter
+ * and positions the top of the page near the top of the pane for natural vertical writing.
+ */
+export function fitWidth(
+  viewW: number,
+  _viewH: number,
+  pageW: number,
+  _pageH: number,
+  gutter = 20,
+  topMargin = 16,
+): ViewMatrix {
+  const availW = Math.max(80, viewW - gutter * 2);
+  const s = clampScale(availW / Math.max(1, pageW));
+  return { scale: s, tx: (viewW - pageW * s) / 2, ty: topMargin };
+}

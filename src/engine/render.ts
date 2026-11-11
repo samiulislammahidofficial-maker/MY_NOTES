@@ -26,31 +26,56 @@ export function strokePath(s: PathSrc, complete = true): Path2D {
     return strokePathCache.get(cacheKey)!;
   }
   const n = s.samples.length / SAMPLE_STRIDE;
+  if (n === 0) return new Path2D();
+
+  // Single-point dot or ultra-short tap: render a clean filled disc so dots/i-tittles/punctuation never disappear
+  let totalLen = 0;
+  for (let i = 1; i < n; i++) {
+    const o = i * SAMPLE_STRIDE;
+    totalLen += Math.hypot(s.samples[o] - s.samples[o - SAMPLE_STRIDE], s.samples[o + 1] - s.samples[o - SAMPLE_STRIDE + 1]);
+  }
+  if (n === 1 || totalLen < 0.35) {
+    const p = new Path2D();
+    const r = Math.max(0.5, (s.width * (tool === 'brush' ? 1.1 : 1.0)) / 2);
+    p.arc(s.samples[0], s.samples[1], r, 0, Math.PI * 2);
+    if (cacheKey) {
+      if (strokePathCache.size >= MAX_PATH_CACHE) {
+        const oldest = strokePathCache.keys().next().value;
+        if (oldest) strokePathCache.delete(oldest);
+      }
+      strokePathCache.set(cacheKey, p);
+    }
+    return p;
+  }
+
   const pts: number[][] = [];
   for (let i = 0; i < n; i++) {
     const o = i * SAMPLE_STRIDE;
-    let p = s.samples[o + 2];
-    if (tool === 'brush') p = Math.pow(p, 1.6);
+    let p = Math.max(0.05, Math.min(1, s.samples[o + 2]));
+    if (tool === 'brush') p = 0.18 + 0.82 * Math.pow(p, 1.35);
     if (tool === 'fountain' && i > 0) {
       const dx = s.samples[o] - s.samples[o - SAMPLE_STRIDE], dy = s.samples[o + 1] - s.samples[o - SAMPLE_STRIDE + 1];
-      const ang = Math.atan2(dy, dx);
-      p *= 0.35 + 0.65 * Math.abs(Math.sin(ang - Math.PI / 4));
+      if (Math.hypot(dx, dy) > 0.25) {
+        const ang = Math.atan2(dy, dx);
+        p *= 0.42 + 0.58 * Math.abs(Math.sin(ang - Math.PI / 4));
+      }
     }
     pts.push([s.samples[o], s.samples[o + 1], p]);
   }
   const cfg = {
-    ballpoint: { thinning: 0.1, smoothing: 0.5, streamline: 0.4 },
-    fountain: { thinning: 0.55, smoothing: 0.6, streamline: 0.5 },
-    brush: { thinning: 0.85, smoothing: 0.7, streamline: 0.55 },
-    highlighter: { thinning: 0, smoothing: 0.5, streamline: 0.4 },
+    ballpoint: { thinning: 0.08, smoothing: 0.35, streamline: 0.2 },
+    fountain: { thinning: 0.48, smoothing: 0.42, streamline: 0.25 },
+    brush: { thinning: 0.72, smoothing: 0.48, streamline: 0.28 },
+    highlighter: { thinning: 0, smoothing: 0.35, streamline: 0.2 },
   }[tool];
   const outline = getStroke(pts, {
-    size: tool === 'brush' ? s.width * 1.6 : s.width,
+    size: tool === 'brush' ? s.width * 1.45 : s.width,
     thinning: cfg.thinning,
     smoothing: cfg.smoothing,
     streamline: s.smoothing ?? cfg.streamline,
     simulatePressure: false,
-    last: complete,
+    // Keep last: true for both live and committed so lifting the pen never causes a sudden curve/width jump!
+    last: true,
     start: tool === 'highlighter' ? { cap: false } : undefined,
     end: tool === 'highlighter' ? { cap: false } : undefined,
   });

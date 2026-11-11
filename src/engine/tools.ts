@@ -4,6 +4,7 @@ export type ToolKind = 'pen' | 'highlighter' | 'eraser' | 'lasso' | 'shape' | 'h
 export type Nib = 'ballpoint' | 'fountain' | 'brush';
 export type StrokeStyle = 'solid' | 'dashed' | 'dotted';
 export type ShapeKind = 'line' | 'rect' | 'ellipse';
+export type PenSmoothingLevel = 'off' | 'low' | 'medium';
 
 export interface ToolSettings {
   kind: ToolKind;
@@ -26,6 +27,8 @@ export interface ToolSettings {
   rulerUnits?: 'metric' | 'imperial';
   /** 0..1 */
   stabilizer: number;
+  /** Simple user-facing smoothing level ('off' | 'low' | 'medium'); default 'low' */
+  penSmoothing?: PenSmoothingLevel;
   penOnly: boolean;
   fingerDrawing: boolean;
   constantPressure: number;

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
-import { PAPER_SIZES, mmToPt, type CustomFontRecord, type PaperSize, type Template, type InkStroke, type Layer, type Notebook, type Page, type PaperKind, type TextBox } from '../domain/types';
-import { AddPageCommand, AddStrokeCommand, ConvertInkToTextCommand, History, ReplaceCommand, UpdateTextBoxCommand, type StrokeTarget } from '../domain/history';
+import { PAPER_SIZES, mmToPt, type CustomFontRecord, type PaperSize, type Template, type ImageBox, type InkStroke, type Layer, type Notebook, type Page, type PaperKind, type TextBox } from '../domain/types';
+import { AddPageCommand, AddStrokeCommand, ConvertInkToTextCommand, History, ReplaceCommand, UpdateImageBoxCommand, UpdateTextBoxCommand, type StrokeTarget } from '../domain/history';
 import { repo } from '../storage/db';
 import { loadSavedCustomFonts } from '../fonts/registry';
 import type { ToolKind, ToolSettings } from '../engine/tools';
@@ -15,6 +15,15 @@ import {
   unlockNotebookToMemory,
   unlockPageToMemory,
 } from '../security/passwordLock';
+import {
+  checkStorageProtection,
+  checkStorageProtectionOnResume,
+  getStorageProtectionSnapshot,
+  requestStorageProtection,
+  subscribeStorageProtection,
+  type StorageProtectionSnapshot,
+} from '../storage/persistence';
+import { cancelActiveRecognitionJobs, hasActiveRecognitionJobs } from '../recognition/provider';
 
 export type SaveStatus = 'idle' | 'saving' | 'saved' | 'failed';
 export type Filter = 'all' | 'untagged' | 'unfiled' | 'trashed' | 'pinned';
@@ -80,6 +89,10 @@ interface State {
   geminiModel: string;
   pageViewMode: 'single' | 'continuous';
   liveAnnouncement: string;
+  storageProtection: StorageProtectionSnapshot;
+  settingsOpen: boolean;
+  updateCheckStatus: 'idle' | 'checking' | 'available' | 'up-to-date' | 'offline-or-error';
+  updateCheckMessage: string | null;
 }
 
 const initialPageViewMode = ((): 'single' | 'continuous' => {
@@ -90,6 +103,46 @@ const initialPageViewMode = ((): 'single' | 'continuous' => {
     return 'single';
   }
 })();
+
+const initialPenSmoothing = ((): 'off' | 'low' | 'medium' => {
+  try {
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem('mynotes.penSmoothing') : null;
+    return v === 'off' || v === 'medium' ? v : 'low';
+  } catch {
+    return 'low';
+  }
+})();
+
+const SESSION_STATE_KEY = 'mynotes.lastSessionState';
+const HISTORY_STORAGE_PREFIX = 'mynotes.history.';
+
+interface SavedSessionState {
+  mode: 'welcome' | 'library' | 'editor';
+  notebookId?: string;
+  pageId?: string;
+  pageViewMode?: 'single' | 'continuous';
+}
+
+function saveLastSessionState(state: SavedSessionState) {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(SESSION_STATE_KEY, JSON.stringify(state));
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function readLastSessionState(): SavedSessionState | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(SESSION_STATE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as SavedSessionState;
+  } catch {
+    return null;
+  }
+}
 
 const initialWelcomed = (() => {
   try {
@@ -126,6 +179,7 @@ export const useApp = create<State>(() => ({
     kind: 'pen', nib: 'ballpoint', strokeStyle: 'solid', color: '#F4F436', rainbow: false, width: mmToPt(0.45), opacity: 1,
     hlColor: '#FFE600', hlWidth: mmToPt(5), hlOpacity: 0.4,
     eraserMode: 'pixel', eraserRadius: 8, shape: 'line', scribbleErase: true, shapeSnap: true, rulerVisible: false, rulerUnits: 'metric', stabilizer: 0.3,
+    penSmoothing: initialPenSmoothing,
     penOnly: true, fingerDrawing: false, constantPressure: 0.5,
   },
   presets: [
@@ -150,6 +204,10 @@ export const useApp = create<State>(() => ({
   geminiModel: 'gemini-2.5-flash',
   pageViewMode: initialPageViewMode,
   liveAnnouncement: '',
+  storageProtection: getStorageProtectionSnapshot(),
+  settingsOpen: false,
+  updateCheckStatus: 'idle',
+  updateCheckMessage: null,
 }));
 
 const set = useApp.setState;
@@ -158,6 +216,7 @@ const get = useApp.getState;
 // ---- in-memory documents ----
 const strokesByPage = new Map<string, InkStroke[]>();
 const textsByPage = new Map<string, TextBox[]>();
+const imagesByPage = new Map<string, ImageBox[]>();
 const pageNotebook = new Map<string, string>();
 const histories = new Map<string, History>();
 const pagesByNotebook = new Map<string, Page[]>();
@@ -171,27 +230,170 @@ export const getActiveLayer = (pageId: string) => activeLayerByPage.get(pageId) 
 
 export const getStrokes = (pageId: string) => strokesByPage.get(pageId) ?? [];
 export const getTexts = (pageId: string) => textsByPage.get(pageId) ?? [];
+export const getImages = (pageId: string) => imagesByPage.get(pageId) ?? [];
 export const getPages = (nbId: string) => pagesByNotebook.get(nbId) ?? [];
 
 function history(nbId: string) {
   let h = histories.get(nbId);
-  if (!h) histories.set(nbId, (h = new History()));
+  if (!h) {
+    h = new History();
+    const nb = get().notebooks.find((n) => n.id === nbId);
+    if (!nb?.passwordLock) {
+      try {
+        const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(HISTORY_STORAGE_PREFIX + nbId) : null;
+        if (raw) h.loadFromJSON(JSON.parse(raw));
+      } catch {
+        /* ignore */
+      }
+    }
+    histories.set(nbId, h);
+  }
   return h;
+}
+
+function persistHistoryForNotebook(nbId: string) {
+  const nb = get().notebooks.find((n) => n.id === nbId);
+  if (!nb) return;
+  if (nb.passwordLock) {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(HISTORY_STORAGE_PREFIX + nbId);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  const h = histories.get(nbId);
+  if (!h) return;
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(HISTORY_STORAGE_PREFIX + nbId, JSON.stringify(h.toJSON(30)));
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 const dirtyPages = new Set<string>();
 const pendingPromises = new Set<Promise<void>>();
 const syncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('mynotes-sync-v1') : null;
+const tabClientId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `tab-${Date.now()}-${Math.random()}`;
+const activeEssentialJobs = new Set<string>();
+
+export function beginEssentialJob(label: string): () => void {
+  const id = `${label}-${Date.now()}-${Math.random()}`;
+  activeEssentialJobs.add(id);
+  return () => {
+    activeEssentialJobs.delete(id);
+  };
+}
+
+export function getEssentialJobBlockReason(): string | null {
+  if (activeEssentialJobs.size > 0) {
+    return 'An export, backup, or encryption operation is still finishing.';
+  }
+  if (hasActiveRecognitionJobs()) {
+    return 'Handwriting recognition is currently running.';
+  }
+  return null;
+}
 
 export const hasPendingWrites = () => pending > 0 || dirtyPages.size > 0;
 export const flushPendingWrites = async () => {
+  // Quiesce any active canvas gesture or text box input first
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('mynotes:quiesce-for-update'));
+  }
   if (pendingPromises.size > 0) {
     await Promise.allSettled([...pendingPromises]);
   }
   if (dirtyPages.size > 0) {
     await actions.retryFailedSaves();
   }
+  // Ensure any unlocked protected notebook/page in this session has its latest plaintext encrypted at rest
+  for (const nb of get().notebooks) {
+    if (nb.passwordLock && isDocumentUnlockedInSession(nb.id)) {
+      const firstPageId = getPages(nb.id)[0]?.id;
+      if (firstPageId) {
+        await persistEncryptedIfLocked(firstPageId, nb.id);
+      }
+    }
+    for (const p of getPages(nb.id)) {
+      if (p.passwordLock && isDocumentUnlockedInSession(p.id)) {
+        await persistEncryptedIfLocked(p.id, nb.id);
+      }
+    }
+  }
 };
+
+/**
+ * Multi-tab safe update coordination over BroadcastChannel('mynotes-sync-v1').
+ * Asks sibling open tabs to flush their writes and confirm readiness.
+ * If any sibling tab reports dirty/busy or fails to respond after a ping, returns `{ ok: false, reason }`.
+ */
+export async function coordinateMultiTabUpdateReadiness(timeoutMs = 1200): Promise<{ ok: boolean; reason?: string }> {
+  // First flush this tab
+  cancelActiveRecognitionJobs();
+  await flushPendingWrites();
+  const localBlock = getEssentialJobBlockReason();
+  if (localBlock) {
+    return { ok: false, reason: `Update deferred: ${localBlock}` };
+  }
+  if (get().save === 'failed' || hasPendingWrites()) {
+    return { ok: false, reason: 'Update deferred: local changes in this tab could not be saved yet.' };
+  }
+  if (!syncChannel) {
+    return { ok: true };
+  }
+
+  const reqId = `upd-${Date.now()}-${Math.random()}`;
+  const seenPeers = new Set<string>();
+  const readyPeers = new Set<string>();
+  let deferReason: string | null = null;
+
+  return new Promise((resolve) => {
+    const onMsg = (ev: MessageEvent) => {
+      const d = ev.data as {
+        type?: string;
+        reqId?: string;
+        fromTab?: string;
+        ready?: boolean;
+        reason?: string;
+      };
+      if (!d || d.reqId !== reqId || d.fromTab === tabClientId) return;
+      if (d.type === 'update-pong' && d.fromTab) {
+        seenPeers.add(d.fromTab);
+      } else if (d.type === 'update-ack' && d.fromTab) {
+        seenPeers.add(d.fromTab);
+        if (d.ready) {
+          readyPeers.add(d.fromTab);
+        } else {
+          deferReason = d.reason || 'Another open My Notes tab has unsaved changes or an active job.';
+        }
+      }
+    };
+
+    syncChannel.addEventListener('message', onMsg);
+    syncChannel.postMessage({ type: 'update-prepare', reqId, fromTab: tabClientId });
+
+    setTimeout(() => {
+      syncChannel.removeEventListener('message', onMsg);
+      if (deferReason) {
+        resolve({ ok: false, reason: `Update deferred: ${deferReason}` });
+        return;
+      }
+      for (const peer of seenPeers) {
+        if (!readyPeers.has(peer)) {
+          resolve({
+            ok: false,
+            reason: 'Update deferred: another open My Notes tab is still busy saving or did not acknowledge readiness in time.',
+          });
+          return;
+        }
+      }
+      resolve({ ok: true });
+    }, timeoutMs);
+  });
+}
 
 function track(op: () => Promise<void>, pageId?: string, nbId?: string) {
   pending++;
@@ -223,11 +425,13 @@ async function persistEncryptedIfLocked(pageId: string, nbId: string): Promise<b
     const pages = getPages(nbId);
     const sMap: Record<string, InkStroke[]> = {};
     const tMap: Record<string, TextBox[]> = {};
+    const imMap: Record<string, ImageBox[]> = {};
     for (const p of pages) {
       sMap[p.id] = getStrokes(p.id);
       tMap[p.id] = getTexts(p.id);
+      imMap[p.id] = getImages(p.id);
     }
-    const env = await lockNotebookAtRest(nb, nbPw, sMap, tMap);
+    const env = await lockNotebookAtRest(nb, nbPw, sMap, tMap, imMap);
     set({
       notebooks: get().notebooks.map((n) => (n.id === nbId ? { ...n, passwordLock: env, updatedAt: Date.now() } : n)),
     });
@@ -236,7 +440,7 @@ async function persistEncryptedIfLocked(pageId: string, nbId: string): Promise<b
   const page = getPages(nbId).find((p) => p.id === pageId);
   const pagePw = getSessionPassword(pageId);
   if (page?.passwordLock && pagePw) {
-    const env = await lockPageAtRest(page, pagePw, getStrokes(pageId), getTexts(pageId));
+    const env = await lockPageAtRest(page, pagePw, getStrokes(pageId), getTexts(pageId), getImages(pageId));
     pagesByNotebook.set(
       nbId,
       getPages(nbId).map((p) => (p.id === pageId ? { ...p, passwordLock: env } : p)),
@@ -310,6 +514,33 @@ const target: StrokeTarget = {
       () =>
         persistEncryptedIfLocked(pageId, nb).then((handled) => {
           if (!handled) return repo.deleteText(id, nb);
+        }),
+      pageId,
+      nb,
+    );
+  },
+  addImage(img) {
+    const list = [...getImages(img.pageId).filter((x) => x.id !== img.id), img];
+    imagesByPage.set(img.pageId, list);
+    const nb = pageNotebook.get(img.pageId)!;
+    set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
+    track(
+      () =>
+        persistEncryptedIfLocked(img.pageId, nb).then((handled) => {
+          if (!handled) return repo.putImage(img, nb);
+        }),
+      img.pageId,
+      nb,
+    );
+  },
+  removeImage(pageId, id) {
+    imagesByPage.set(pageId, getImages(pageId).filter((x) => x.id !== id));
+    const nb = pageNotebook.get(pageId)!;
+    set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
+    track(
+      () =>
+        persistEncryptedIfLocked(pageId, nb).then((handled) => {
+          if (!handled) return repo.deleteImage(id, nb);
         }),
       pageId,
       nb,
@@ -401,6 +632,7 @@ function refreshUndo() {
   const p = get().panes[get().activePane];
   if (!p) return set({ canUndo: false, canRedo: false });
   const h = history(p.notebookId);
+  persistHistoryForNotebook(p.notebookId);
   set({ canUndo: h.canUndo, canRedo: h.canRedo });
 }
 
@@ -422,11 +654,73 @@ export const actions = {
       set({ notebooks: nbs });
     }
     const customFonts = await loadSavedCustomFonts().catch(() => []);
-    set({ notebooks: await repo.allNotebooks(), customFonts, ready: true });
+    const allNbs = await repo.allNotebooks();
+    set({ notebooks: allNbs, customFonts });
+
+    // Resume last open notebook & page if the user was editing an unprotected notebook
+    const hash = typeof window !== 'undefined' ? window.location.hash : '';
+    const forceWelcomeOrLibrary =
+      hash === '#welcome' || hash === '#how-it-works' || hash === '#about-us' || hash === '#library';
+    if (!forceWelcomeOrLibrary) {
+      const saved = readLastSessionState();
+      if (saved?.mode === 'editor' && saved.notebookId) {
+        const targetNb = allNbs.find((n) => n.id === saved.notebookId && !n.trashedAt);
+        if (targetNb && !targetNb.passwordLock) {
+          await actions.openNotebook(targetNb.id);
+          if (saved.pageId && targetNb.pageIds.includes(saved.pageId)) {
+            actions.setPage(0, saved.pageId);
+          }
+          if (saved.pageViewMode) {
+            set({ pageViewMode: saved.pageViewMode });
+          }
+        }
+      }
+    }
+
+    set({ ready: true });
+
+    subscribeStorageProtection((snap) => {
+      set({
+        storageProtection: snap,
+        persisted: snap.status === 'granted' ? true : snap.status === 'not-granted' ? false : null,
+      });
+    });
 
     if (syncChannel) {
       syncChannel.onmessage = async (ev) => {
-        const msg = ev.data as { type?: string; notebookId?: string; pageId?: string };
+        const msg = ev.data as {
+          type?: string;
+          notebookId?: string;
+          pageId?: string;
+          reqId?: string;
+          fromTab?: string;
+        };
+        if (msg?.type === 'update-prepare' && msg.reqId && msg.fromTab !== tabClientId) {
+          // Immediately announce presence so the coordinating tab waits for our ack
+          syncChannel.postMessage({ type: 'update-pong', reqId: msg.reqId, fromTab: tabClientId });
+          try {
+            cancelActiveRecognitionJobs();
+            await flushPendingWrites();
+            const jobBlock = getEssentialJobBlockReason();
+            const isClean = !jobBlock && get().save !== 'failed' && !hasPendingWrites();
+            syncChannel.postMessage({
+              type: 'update-ack',
+              reqId: msg.reqId,
+              fromTab: tabClientId,
+              ready: isClean,
+              reason: jobBlock || (isClean ? undefined : 'Another open tab has unsaved changes that need attention.'),
+            });
+          } catch {
+            syncChannel.postMessage({
+              type: 'update-ack',
+              reqId: msg.reqId,
+              fromTab: tabClientId,
+              ready: false,
+              reason: 'Another open tab could not finish saving.',
+            });
+          }
+          return;
+        }
         if (msg?.type === 'notebook-updated' && msg.notebookId) {
           // Do not overwrite a page that currently has unsaved dirty writes in this tab
           if (msg.pageId && dirtyPages.has(msg.pageId)) return;
@@ -444,13 +738,31 @@ export const actions = {
       };
     }
 
-    try {
-      if (navigator.storage?.persist) {
-        const already = (await navigator.storage.persisted?.()) ?? false;
-        set({ persisted: already || (await navigator.storage.persist()) });
-      }
-    } catch {
-      set({ persisted: false });
+    // Feature-detect and query persisted() and estimate() first on launch without calling persist() automatically
+    await checkStorageProtection();
+
+    if (typeof window !== 'undefined') {
+      const onResume = () => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        void checkStorageProtectionOnResume(15_000);
+      };
+      window.addEventListener('focus', onResume);
+      document.addEventListener('visibilitychange', onResume);
+    }
+  },
+
+  async requestStorageProtectionAction(): Promise<StorageProtectionSnapshot> {
+    return requestStorageProtection();
+  },
+
+  async refreshStorageProtectionAction(): Promise<StorageProtectionSnapshot> {
+    return checkStorageProtection();
+  },
+
+  setSettingsOpen(open: boolean) {
+    set({ settingsOpen: open });
+    if (open) {
+      void checkStorageProtection();
     }
   },
 
@@ -533,6 +845,7 @@ export const actions = {
       pageNotebook.set(p.id, id);
       if (!strokesByPage.has(p.id)) strokesByPage.set(p.id, await repo.getStrokes(p.id));
       if (!textsByPage.has(p.id)) textsByPage.set(p.id, await repo.getTexts(p.id));
+      if (!imagesByPage.has(p.id)) imagesByPage.set(p.id, await repo.getImages(p.id));
       if (!layersByPage.has(p.id)) {
         const ls = await repo.getLayers(p.id);
         layersByPage.set(p.id, p.layerIds.map((id) => ls.find((l) => l.id === id)).filter((l): l is Layer => !!l));
@@ -552,6 +865,9 @@ export const actions = {
     const tabs = st.tabs.includes(id) ? st.tabs : [...st.tabs, id];
     const pageViewMode = nb?.pageViewMode ?? st.pageViewMode;
     set({ mode: 'editor', panes, tabs, activePane: idx, paper: nb?.paper ?? '#000000', pageViewMode });
+    if (!nb?.passwordLock) {
+      saveLastSessionState({ mode: 'editor', notebookId: id, pageId: pages[0].id, pageViewMode });
+    }
     refreshUndo();
   },
 
@@ -559,8 +875,16 @@ export const actions = {
     const st = get();
     const tabs = st.tabs.filter((t) => t !== id);
     const panes = st.panes.filter((p) => p.notebookId !== id);
-    if (tabs.length === 0) return set({ tabs, panes: [], mode: 'library', split: false });
-    set({ tabs, panes: panes.length ? panes : [{ notebookId: tabs[0], pageId: getPages(tabs[0])[0]?.id }], activePane: 0, split: panes.length > 1 && st.split });
+    if (tabs.length === 0) {
+      saveLastSessionState({ mode: 'library' });
+      return set({ tabs, panes: [], mode: 'library', split: false });
+    }
+    const nextPageId = panes.length ? panes[0].pageId : getPages(tabs[0])[0]?.id;
+    set({ tabs, panes: panes.length ? panes : [{ notebookId: tabs[0], pageId: nextPageId }], activePane: 0, split: panes.length > 1 && st.split });
+    const nextNb = get().notebooks.find((n) => n.id === tabs[0]);
+    if (nextNb && !nextNb.passwordLock) {
+      saveLastSessionState({ mode: 'editor', notebookId: tabs[0], pageId: nextPageId, pageViewMode: get().pageViewMode });
+    }
     refreshUndo();
   },
 
@@ -573,6 +897,7 @@ export const actions = {
     } catch {
       /* ignore */
     }
+    saveLastSessionState({ mode: 'library' });
     set({ mode: 'library' });
   },
 
@@ -587,11 +912,13 @@ export const actions = {
     const pages = getPages(id);
     const sMap: Record<string, InkStroke[]> = {};
     const tMap: Record<string, TextBox[]> = {};
+    const imMap: Record<string, ImageBox[]> = {};
     for (const p of pages) {
       sMap[p.id] = getStrokes(p.id);
       tMap[p.id] = getTexts(p.id);
+      imMap[p.id] = getImages(p.id);
     }
-    await lockNotebookAtRest(nb, password, sMap, tMap);
+    await lockNotebookAtRest(nb, password, sMap, tMap, imMap);
     // Lock immediately so opening it requires the password unless currently editing in active pane
     const isCurrentlyOpen = get().mode === 'editor' && get().tabs.includes(id);
     if (!isCurrentlyOpen) {
@@ -599,6 +926,7 @@ export const actions = {
       for (const p of pages) {
         strokesByPage.delete(p.id);
         textsByPage.delete(p.id);
+        imagesByPage.delete(p.id);
       }
     } else {
       await unlockNotebookToMemory({ ...nb, passwordLock: (await repo.allNotebooks()).find((x) => x.id === id)?.passwordLock }, password);
@@ -610,7 +938,7 @@ export const actions = {
     const all = await repo.allNotebooks();
     const nb = all.find((n) => n.id === id);
     if (!nb) throw new Error('Notebook not found.');
-    const { strokesByPage: sMap, textsByPage: tMap } = await unlockNotebookToMemory(nb, password);
+    const { strokesByPage: sMap, textsByPage: tMap, imagesByPage: imMap } = await unlockNotebookToMemory(nb, password);
     const pages = await repo.getPages(id);
     const ordered = nb.pageIds.map((pid) => pages.find((p) => p.id === pid)).filter((p): p is Page => !!p);
     pagesByNotebook.set(id, ordered);
@@ -618,6 +946,7 @@ export const actions = {
       pageNotebook.set(p.id, id);
       strokesByPage.set(p.id, sMap[p.id] ?? []);
       textsByPage.set(p.id, tMap[p.id] ?? []);
+      imagesByPage.set(p.id, imMap[p.id] ?? []);
       const ls = await repo.getLayers(p.id);
       layersByPage.set(p.id, p.layerIds.map((lid) => ls.find((l) => l.id === lid)).filter((l): l is Layer => !!l));
     }
@@ -634,15 +963,16 @@ export const actions = {
     const all = await repo.allNotebooks();
     const nb = all.find((n) => n.id === id);
     if (!nb) throw new Error('Notebook not found.');
-    const { strokesByPage: sMap, textsByPage: tMap } = await unlockNotebookToMemory(nb, currentPassword);
+    const { strokesByPage: sMap, textsByPage: tMap, imagesByPage: imMap } = await unlockNotebookToMemory(nb, currentPassword);
     // Merge any in-memory edits if currently unlocked
     if (isDocumentUnlockedInSession(id)) {
       for (const p of getPages(id)) {
         if (strokesByPage.has(p.id)) sMap[p.id] = getStrokes(p.id);
         if (textsByPage.has(p.id)) tMap[p.id] = getTexts(p.id);
+        if (imagesByPage.has(p.id)) imMap[p.id] = getImages(p.id);
       }
     }
-    await lockNotebookAtRest(nb, newPassword, sMap, tMap);
+    await lockNotebookAtRest(nb, newPassword, sMap, tMap, imMap);
     const updatedAll = await repo.allNotebooks();
     const updatedNb = updatedAll.find((n) => n.id === id)!;
     if (get().mode === 'editor' && get().tabs.includes(id)) {
@@ -663,9 +993,13 @@ export const actions = {
     const inMemT: Record<string, TextBox[]> | undefined = isDocumentUnlockedInSession(id)
       ? Object.fromEntries(getPages(id).map((p) => [p.id, getTexts(p.id)]))
       : undefined;
-    const { strokesByPage: sMap, textsByPage: tMap } = await removeNotebookPassword(nb, currentPassword, inMemS, inMemT);
+    const inMemIm: Record<string, ImageBox[]> | undefined = isDocumentUnlockedInSession(id)
+      ? Object.fromEntries(getPages(id).map((p) => [p.id, getImages(p.id)]))
+      : undefined;
+    const { strokesByPage: sMap, textsByPage: tMap, imagesByPage: imMap } = await removeNotebookPassword(nb, currentPassword, inMemS, inMemT, inMemIm);
     for (const [pid, s] of Object.entries(sMap)) strokesByPage.set(pid, s);
     for (const [pid, t] of Object.entries(tMap)) textsByPage.set(pid, t);
+    for (const [pid, im] of Object.entries(imMap)) imagesByPage.set(pid, im);
     set((st) => ({ notebooks: [], strokeVersion: st.strokeVersion + 1 }));
     set({ notebooks: await repo.allNotebooks() });
   },
@@ -677,16 +1011,19 @@ export const actions = {
     if (nb?.passwordLock && pw) {
       const sMap: Record<string, InkStroke[]> = {};
       const tMap: Record<string, TextBox[]> = {};
+      const imMap: Record<string, ImageBox[]> = {};
       for (const p of pages) {
         sMap[p.id] = getStrokes(p.id);
         tMap[p.id] = getTexts(p.id);
+        imMap[p.id] = getImages(p.id);
       }
-      await lockNotebookAtRest(nb, pw, sMap, tMap);
+      await lockNotebookAtRest(nb, pw, sMap, tMap, imMap);
     }
     clearSessionUnlock(id);
     for (const p of pages) {
       strokesByPage.delete(p.id);
       textsByPage.delete(p.id);
+      imagesByPage.delete(p.id);
     }
     histories.delete(id);
     set({ notebooks: await repo.allNotebooks() });
@@ -700,7 +1037,7 @@ export const actions = {
     if (!nbId) return;
     const page = getPages(nbId).find((p) => p.id === pageId);
     if (!page) return;
-    const env = await lockPageAtRest(page, password, getStrokes(pageId), getTexts(pageId));
+    const env = await lockPageAtRest(page, password, getStrokes(pageId), getTexts(pageId), getImages(pageId));
     const updatedPage: Page = { ...page, passwordLock: env };
     pagesByNotebook.set(
       nbId,
@@ -709,6 +1046,7 @@ export const actions = {
     clearSessionUnlock(pageId);
     strokesByPage.set(pageId, []);
     textsByPage.set(pageId, []);
+    imagesByPage.set(pageId, []);
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
   },
 
@@ -718,9 +1056,10 @@ export const actions = {
     const pages = await repo.getPages(nbId);
     const page = pages.find((p) => p.id === pageId);
     if (!page) throw new Error('Page not found.');
-    const { strokes, texts } = await unlockPageToMemory(page, password);
+    const { strokes, texts, images } = await unlockPageToMemory(page, password);
     strokesByPage.set(pageId, strokes);
     textsByPage.set(pageId, texts);
+    imagesByPage.set(pageId, images);
     pagesByNotebook.set(
       nbId,
       getPages(nbId).map((p) => (p.id === pageId ? page : p)),
@@ -734,14 +1073,16 @@ export const actions = {
     const pages = await repo.getPages(nbId);
     const page = pages.find((p) => p.id === pageId);
     if (!page) throw new Error('Page not found.');
-    const { strokes, texts } = await unlockPageToMemory(page, currentPassword);
+    const { strokes, texts, images } = await unlockPageToMemory(page, currentPassword);
     const activeStrokes = isDocumentUnlockedInSession(pageId) && strokesByPage.get(pageId)?.length ? getStrokes(pageId) : strokes;
     const activeTexts = isDocumentUnlockedInSession(pageId) && textsByPage.get(pageId)?.length ? getTexts(pageId) : texts;
-    const env = await lockPageAtRest(page, newPassword, activeStrokes, activeTexts);
+    const activeImages = isDocumentUnlockedInSession(pageId) && imagesByPage.get(pageId)?.length ? getImages(pageId) : images;
+    const env = await lockPageAtRest(page, newPassword, activeStrokes, activeTexts, activeImages);
     const updatedPage: Page = { ...page, passwordLock: env };
     await unlockPageToMemory(updatedPage, newPassword);
     strokesByPage.set(pageId, activeStrokes);
     textsByPage.set(pageId, activeTexts);
+    imagesByPage.set(pageId, activeImages);
     pagesByNotebook.set(
       nbId,
       getPages(nbId).map((p) => (p.id === pageId ? updatedPage : p)),
@@ -757,9 +1098,11 @@ export const actions = {
     if (!page) throw new Error('Page not found.');
     const inMemS = isDocumentUnlockedInSession(pageId) && strokesByPage.get(pageId)?.length ? getStrokes(pageId) : undefined;
     const inMemT = isDocumentUnlockedInSession(pageId) && textsByPage.get(pageId)?.length ? getTexts(pageId) : undefined;
-    const { strokes, texts } = await removePagePassword(page, currentPassword, inMemS, inMemT);
+    const inMemIm = isDocumentUnlockedInSession(pageId) && imagesByPage.get(pageId)?.length ? getImages(pageId) : undefined;
+    const { strokes, texts, images } = await removePagePassword(page, currentPassword, inMemS, inMemT, inMemIm);
     strokesByPage.set(pageId, strokes);
     textsByPage.set(pageId, texts);
+    imagesByPage.set(pageId, images);
     pagesByNotebook.set(
       nbId,
       getPages(nbId).map((p) => (p.id === pageId ? { ...p, passwordLock: null } : p)),
@@ -773,7 +1116,7 @@ export const actions = {
     const page = getPages(nbId).find((p) => p.id === pageId);
     const pw = getSessionPassword(pageId);
     if (page?.passwordLock && pw) {
-      const env = await lockPageAtRest(page, pw, getStrokes(pageId), getTexts(pageId));
+      const env = await lockPageAtRest(page, pw, getStrokes(pageId), getTexts(pageId), getImages(pageId));
       pagesByNotebook.set(
         nbId,
         getPages(nbId).map((p) => (p.id === pageId ? { ...p, passwordLock: env } : p)),
@@ -782,10 +1125,12 @@ export const actions = {
     clearSessionUnlock(pageId);
     strokesByPage.set(pageId, []);
     textsByPage.set(pageId, []);
+    imagesByPage.set(pageId, []);
     set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
   },
 
   closeEditor() {
+    saveLastSessionState({ mode: 'library' });
     set({ mode: 'library' });
   },
 
@@ -793,6 +1138,11 @@ export const actions = {
     const panes = [...get().panes];
     panes[pane] = { ...panes[pane], pageId };
     set({ panes });
+    const nbId = panes[pane]?.notebookId;
+    const nb = nbId ? get().notebooks.find((n) => n.id === nbId) : undefined;
+    if (nb && !nb.passwordLock) {
+      saveLastSessionState({ mode: 'editor', notebookId: nb.id, pageId, pageViewMode: get().pageViewMode });
+    }
   },
 
   setActivePane(i: number) {
@@ -864,6 +1214,15 @@ export const actions = {
     if (get().activePreset === i) actions.selectPreset(i);
   },
   setTool(patch: Partial<ToolSettings>) {
+    if (patch.penSmoothing) {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('mynotes.penSmoothing', patch.penSmoothing);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
     set((s) => ({ tool: { ...s.tool, ...patch } }));
   },
 
@@ -885,6 +1244,13 @@ export const actions = {
     const nb = pageNotebook.get(pageId);
     if (!nb) return;
     history(nb).run(new UpdateTextBoxCommand(pageId, prev, next), target);
+    refreshUndo();
+  },
+
+  commitImageEdit(pageId: string, prev: ImageBox | null, next: ImageBox | null) {
+    const nb = pageNotebook.get(pageId);
+    if (!nb) return;
+    history(nb).run(new UpdateImageBoxCommand(pageId, prev, next), target);
     refreshUndo();
   },
 

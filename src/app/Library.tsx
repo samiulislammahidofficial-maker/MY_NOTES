@@ -184,9 +184,8 @@ export function Library() {
   const handleExportAllBackup = async () => {
     setBusyMsg('Creating full offline backup (.tabletnotes.zip)…');
     try {
-      const { buildBackupZipBytes, saveOrShareFileBytes } = await loadBackupManager();
-      const bytes = await buildBackupZipBytes();
-      await saveOrShareFileBytes(bytes, `MyNotes-Backup-${new Date().toISOString().slice(0, 10)}.tabletnotes.zip`, 'application/zip');
+      const { exportBackupArchiveFlow } = await loadBackupManager();
+      await exportBackupArchiveFlow();
     } catch (err) {
       alert(`Backup failed: ${(err as Error).message}`);
     } finally {
@@ -232,6 +231,14 @@ export function Library() {
           </button>
           <button
             className="nav-row"
+            onClick={() => actions.setSettingsOpen(true)}
+            title="Storage protection, backups, and app updates"
+          >
+            <Settings2 size={20} />
+            <span>Settings</span>
+          </button>
+          <button
+            className="nav-row"
             onClick={() => actions.openWelcome('how-it-works')}
             title="Watch demo and installation guide"
           >
@@ -247,11 +254,31 @@ export function Library() {
             <span>About Us</span>
           </button>
         </nav>
-        {s.persisted !== null && (
-          <p className="persist">
-            {s.persisted ? 'Persistent storage granted' : 'Persistent storage not granted – back up regularly'}
-          </p>
-        )}
+        <div
+          className="persist"
+          style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}
+        >
+          <span>
+            {s.storageProtection.status === 'granted'
+              ? 'Storage protection enabled'
+              : 'Notes are saved on this device. Keep a backup.'}
+          </span>
+          <button
+            type="button"
+            onClick={() => actions.setSettingsOpen(true)}
+            style={{
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              color: '#0A84FF',
+              fontSize: 12,
+              cursor: 'pointer',
+              textDecoration: 'underline',
+            }}
+          >
+            Storage & update settings
+          </button>
+        </div>
       </aside>
       <main className="lib-main">
         <header className="lib-head">
