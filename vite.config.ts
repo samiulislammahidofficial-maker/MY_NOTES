@@ -109,7 +109,14 @@ export default defineConfig({
         globIgnores: ['**/tutorial/*.mp4', '**/ort-wasm*.wasm', '**/trocrWorker*.js'],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         cleanupOutdatedCaches: true,
-        navigateFallbackDenylist: [/\/assets\/.*/, /\/tutorial\/.*/, /\/icons\/.*/, /\/fonts\/.*/, /\.(?:js|mjs|css|wasm|json|png|svg|mp4|vtt|ttf|zip)$/i],
+        navigateFallbackDenylist: [
+          /\/assets\/.*/,
+          /\/tutorial\/.*/,
+          /\/icons\/.*/,
+          /\/fonts\/.*/,
+          /\/pen-input-test\.html$/,
+          /\.(?:js|mjs|css|wasm|json|png|svg|mp4|vtt|ttf|zip)$/i,
+        ],
         runtimeCaching: [
           {
             urlPattern: /\/tutorial\/.*\.(mp4|vtt|png)$/,

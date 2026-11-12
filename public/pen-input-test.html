@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Pen Input Hardware Diagnostics</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #0D0D11;
+      color: #F5F5F7;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .container {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      padding: 16px;
+      gap: 12px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: #18181E;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .title-group h1 {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: #FFFFFF;
+    }
+    .title-group p {
+      font-size: 13px;
+      color: #8E8E93;
+      margin-top: 2px;
+    }
+    .counter-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: #18181E;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .card.pen {
+      border-color: rgba(48, 209, 88, 0.35);
+      background: linear-gradient(180deg, rgba(48, 209, 88, 0.08) 0%, #18181E 100%);
+    }
+    .card.touch {
+      border-color: rgba(255, 159, 10, 0.35);
+      background: linear-gradient(180deg, rgba(255, 159, 10, 0.08) 0%, #18181E 100%);
+    }
+    .card.stylus-touch {
+      border-color: rgba(10, 132, 255, 0.35);
+      background: linear-gradient(180deg, rgba(10, 132, 255, 0.08) 0%, #18181E 100%);
+    }
+    .card-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #8E8E93;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .card-num {
+      font-size: 32px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .card.pen .card-num { color: #30D158; }
+    .card.touch .card-num { color: #FF9F0A; }
+    .card.stylus-touch .card-num { color: #64D2FF; }
+
+    .instructions-bar {
+      background: #1F1F27;
+      padding: 10px 16px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 13px;
+      color: #E5E5EA;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .instructions-highlight {
+      font-weight: 700;
+      color: #FFD60A;
+    }
+
+    .btn-reset {
+      background: #2C2C34;
+      color: #FFFFFF;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      font-size: 14px;
+      font-weight: 600;
+      padding: 8px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.05s ease;
+    }
+    .btn-reset:hover {
+      background: #3A3A44;
+    }
+    .btn-reset:active {
+      transform: scale(0.97);
+    }
+
+    #test-area {
+      flex: 1;
+      width: 100%;
+      min-height: 200px;
+      background: #121217;
+      border: 2px dashed rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      touch-action: none;
+      position: relative;
+      cursor: crosshair;
+      overflow: hidden;
+    }
+    #test-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+    .watermark {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      font-size: 20px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.12);
+      text-align: center;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title-group">
+        <h1>Pen Input Hardware Diagnostics (Standalone)</h1>
+        <p>Zero dependencies, raw browser PointerEvent & TouchEvent diagnostic probe</p>
+      </div>
+      <button id="btn-reset" class="btn-reset" type="button">Reset Counters & Dots</button>
+    </header>
+
+    <div class="counter-cards">
+      <div class="card pen">
+        <span class="card-label">1. Pen pointerdown</span>
+        <span id="cnt-pen" class="card-num">0</span>
+        <span style="font-size: 11px; color: #8E8E93;">pointerType === 'pen' (marks dot)</span>
+      </div>
+      <div class="card touch">
+        <span class="card-label">2. Touch pointerdown</span>
+        <span id="cnt-touch" class="card-num">0</span>
+        <span style="font-size: 11px; color: #8E8E93;">pointerType === 'touch'</span>
+      </div>
+      <div class="card stylus-touch">
+        <span class="card-label">3. Stylus touchstart</span>
+        <span id="cnt-stylus" class="card-num">0</span>
+        <span id="desc-stylus" style="font-size: 11px; color: #8E8E93;">changedTouches[i].touchType === 'stylus'</span>
+      </div>
+    </div>
+
+    <div class="instructions-bar">
+      <span>
+        👉 <span class="instructions-highlight">Task:</span> Make exactly <strong>20 short marks</strong> with your Apple Pencil or S-Pen in the area below, lifting the pen completely after each mark.
+      </span>
+      <span id="status-hint" style="font-size: 12px; color: #A1A1A6;">Target: 20 marks</span>
+    </div>
+
+    <div id="test-area">
+      <div class="watermark">Test Area<br>(touch-action: none)</div>
+      <canvas id="test-canvas"></canvas>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      let penCount = 0;
+      let touchCount = 0;
+      let stylusTouchCount = 0;
+
+      const elPen = document.getElementById('cnt-pen');
+      const elTouch = document.getElementById('cnt-touch');
+      const elStylus = document.getElementById('cnt-stylus');
+      const descStylus = document.getElementById('desc-stylus');
+      const statusHint = document.getElementById('status-hint');
+      const btnReset = document.getElementById('btn-reset');
+      const area = document.getElementById('test-area');
+      const canvas = document.getElementById('test-canvas');
+      const ctx = canvas.getContext('2d');
+
+      let dpr = window.devicePixelRatio || 1;
+
+      function resizeCanvas() {
+        const rect = canvas.getBoundingClientRect();
+        dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.round(rect.width * dpr);
+        canvas.height = Math.round(rect.height * dpr);
+        ctx.scale(dpr, dpr);
+      }
+
+      window.addEventListener('resize', resizeCanvas);
+      resizeCanvas();
+
+      function updateStatus() {
+        if (penCount === 20) {
+          statusHint.textContent = '✅ Exactly 20 pen marks captured!';
+          statusHint.style.color = '#30D158';
+        } else if (penCount > 20) {
+          statusHint.textContent = `Completed ${penCount} marks (Target was 20)`;
+          statusHint.style.color = '#FF9F0A';
+        } else {
+          statusHint.textContent = `Progress: ${penCount} / 20 marks`;
+          statusHint.style.color = '#A1A1A6';
+        }
+      }
+
+      function drawDot(x, y, pressure) {
+        const r = Math.max(3, Math.min(10, (pressure || 0.5) * 8 + 2));
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = '#30D158';
+        ctx.fill();
+
+        // Glow ring
+        ctx.beginPath();
+        ctx.arc(x, y, r + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(48, 209, 88, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Label dot number
+        ctx.font = '10px -apple-system, sans-serif';
+        ctx.fillStyle = '#FFFFFF';
+        ctx.textAlign = 'center';
+        ctx.fillText(String(penCount), x, y - r - 6);
+        ctx.restore();
+      }
+
+      // 1. PointerEvent listener (pen pointerdown and touch pointerdown)
+      area.addEventListener('pointerdown', function (e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        if (e.pointerType === 'pen') {
+          penCount++;
+          elPen.textContent = String(penCount);
+          drawDot(x, y, e.pressure);
+          updateStatus();
+        } else if (e.pointerType === 'touch') {
+          touchCount++;
+          elTouch.textContent = String(touchCount);
+        }
+      });
+
+      // 2. Stylus touchstart listener (passive: true)
+      let stylusSupported = false;
+      area.addEventListener('touchstart', function (e) {
+        if (e.changedTouches) {
+          for (let i = 0; i < e.changedTouches.length; i++) {
+            const t = e.changedTouches[i];
+            if (t.touchType !== undefined) {
+              stylusSupported = true;
+            }
+            if (t.touchType === 'stylus') {
+              stylusTouchCount++;
+              elStylus.textContent = String(stylusTouchCount);
+            }
+          }
+        }
+      }, { passive: true });
+
+      // After first touch check if touchType is supported
+      window.addEventListener('touchstart', function checkTouchType(e) {
+        if (e.changedTouches && e.changedTouches.length > 0) {
+          if (e.changedTouches[0].touchType !== undefined) {
+            descStylus.textContent = 'touchType property supported';
+          } else {
+            descStylus.textContent = 'touchType property not exposed by browser';
+          }
+          window.removeEventListener('touchstart', checkTouchType);
+        }
+      }, { passive: true });
+
+      btnReset.addEventListener('click', function () {
+        penCount = 0;
+        touchCount = 0;
+        stylusTouchCount = 0;
+        elPen.textContent = '0';
+        elTouch.textContent = '0';
+        elStylus.textContent = '0';
+        statusHint.textContent = 'Target: 20 marks';
+        statusHint.style.color = '#A1A1A6';
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      });
+    })();
+  </script>
+</body>
+</html>
