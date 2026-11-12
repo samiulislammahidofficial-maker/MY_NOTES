@@ -61,6 +61,7 @@ import {
 import { detectScribble } from '../src/engine/scribble';
 import { boundsOf, strokePath } from '../src/engine/render';
 import { writingDiagnostics } from '../src/engine/diagnostics';
+import { PenDiagnosticEngine } from '../src/engine/penDiagnosticEngine';
 import { SAMPLE_STRIDE, type InkStroke } from '../src/domain/types';
 
 const rect = { left: 40, top: 20 };
@@ -929,6 +930,218 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
         ballpointModel: 'compatibility',
       });
       expect(compatPath).toBeInstanceOf(Path2D);
+    });
+  });
+
+  describe('standalone pen input diagnostic engine', () => {
+    it('records exactly 26 and 40 synthetic pen pointerdowns without any cap, stop condition, or display limit', () => {
+      const engine = new PenDiagnosticEngine();
+
+      // Test 26 synthetic pen pointerdown events
+      for (let i = 1; i <= 26; i++) {
+        engine.handlePointerEvent({
+          type: 'pointerdown',
+          pointerId: 100 + i,
+          pointerType: 'pen',
+          clientX: 50 + (i * 10),
+          clientY: 100,
+          pressure: 0.5,
+          timeStamp: 1000 + (i * 50),
+        });
+        engine.handlePointerEvent({
+          type: 'pointerup',
+          pointerId: 100 + i,
+          pointerType: 'pen',
+          clientX: 50 + (i * 10),
+          clientY: 100,
+          pressure: 0,
+          timeStamp: 1000 + (i * 50) + 10,
+        });
+      }
+
+      expect(engine.counters.penPointerDown).toBe(26);
+      expect(engine.counters.renderedDots).toBe(26);
+      expect(engine.counters.strokesCreated).toBe(26);
+      expect(engine.renderedDotsList.length).toBe(26);
+      expect(engine.renderedDotsList[25].index).toBe(26);
+
+      // Continue to 40 synthetic marks without reset
+      for (let i = 27; i <= 40; i++) {
+        engine.handlePointerEvent({
+          type: 'pointerdown',
+          pointerId: 100 + i,
+          pointerType: 'pen',
+          clientX: 50 + (i * 10),
+          clientY: 100,
+          pressure: 0.5,
+          timeStamp: 1000 + (i * 50),
+        });
+        engine.handlePointerEvent({
+          type: 'pointerup',
+          pointerId: 100 + i,
+          pointerType: 'pen',
+          clientX: 50 + (i * 10),
+          clientY: 100,
+          pressure: 0,
+          timeStamp: 1000 + (i * 50) + 10,
+        });
+      }
+
+      expect(engine.counters.penPointerDown).toBe(40);
+      expect(engine.counters.renderedDots).toBe(40);
+      expect(engine.counters.strokesCreated).toBe(40);
+      expect(engine.renderedDotsList.length).toBe(40);
+      expect(engine.renderedDotsList[39].index).toBe(40);
+    });
+
+    it('records timestamped pointer and stylus touch events in trace and keeps finger contacts separate', () => {
+      const engine = new PenDiagnosticEngine();
+
+      // Finger touch
+      engine.handlePointerEvent({
+        type: 'pointerdown',
+        pointerId: 1,
+        pointerType: 'touch',
+        clientX: 200,
+        clientY: 200,
+        pressure: 0,
+        timeStamp: 500,
+      });
+      engine.handleTouchEvent({
+        type: 'touchstart',
+        identifier: 1,
+        touchType: 'direct',
+        clientX: 200,
+        clientY: 200,
+        timeStamp: 500,
+      });
+
+      expect(engine.counters.touchPointerDown).toBe(1);
+      expect(engine.counters.fingerTouchStart).toBe(1);
+      expect(engine.counters.penPointerDown).toBe(0);
+      expect(engine.counters.stylusTouchStart).toBe(0);
+      expect(engine.counters.renderedDots).toBe(0);
+
+      // Stylus touch + pen pointer (concurrent streams for 1 mark)
+      engine.handlePointerEvent({
+        type: 'pointerdown',
+        pointerId: 2,
+        pointerType: 'pen',
+        clientX: 300,
+        clientY: 300,
+        pressure: 0.6,
+        timeStamp: 600,
+      });
+      engine.handleTouchEvent({
+        type: 'touchstart',
+        identifier: 2,
+        touchType: 'stylus',
+        clientX: 300,
+        clientY: 300,
+        timeStamp: 601,
+      });
+      engine.handlePointerEvent({
+        type: 'pointerup',
+        pointerId: 2,
+        pointerType: 'pen',
+        clientX: 300,
+        clientY: 300,
+        pressure: 0,
+        timeStamp: 620,
+      });
+      engine.handleTouchEvent({
+        type: 'touchend',
+        identifier: 2,
+        touchType: 'stylus',
+        clientX: 300,
+        clientY: 300,
+        timeStamp: 620,
+      });
+
+      // Exactly 1 stroke & 1 rendered dot (single pen contact never produces two strokes)
+      expect(engine.counters.penPointerDown).toBe(1);
+      expect(engine.counters.stylusTouchStart).toBe(1);
+      expect(engine.counters.renderedDots).toBe(1);
+      expect(engine.counters.strokesCreated).toBe(1);
+      expect(engine.counters.fallbackStrokes).toBe(0);
+
+      const jsonStr = engine.exportTraceJson(1);
+      const parsed = JSON.parse(jsonStr);
+      expect(parsed.trace.length).toBeGreaterThan(0);
+      expect(parsed.trace.some((ev: any) => ev.stream === 'pointer')).toBe(true);
+      expect(parsed.trace.some((ev: any) => ev.stream === 'touch')).toBe(true);
+      expect(parsed.trace.some((ev: any) => ev.stream === 'system' && ev.type === 'dot_rendered')).toBe(true);
+    });
+
+    it('falls back to stylus touchstart when pointerdown is dropped, never duplicating when both arrive', () => {
+      const engine = new PenDiagnosticEngine();
+
+      // Case A: Dropped pointerdown -> only stylus touchstart arrives
+      engine.handleTouchEvent({
+        type: 'touchstart',
+        identifier: 10,
+        touchType: 'stylus',
+        clientX: 150,
+        clientY: 150,
+        force: 0.7,
+        timeStamp: 1000,
+      });
+      engine.handleTouchEvent({
+        type: 'touchend',
+        identifier: 10,
+        touchType: 'stylus',
+        clientX: 150,
+        clientY: 150,
+        timeStamp: 1020,
+      });
+
+      expect(engine.counters.penPointerDown).toBe(0);
+      expect(engine.counters.stylusTouchStart).toBe(1);
+      expect(engine.counters.fallbackStrokes).toBe(1);
+      expect(engine.counters.strokesCreated).toBe(1);
+      expect(engine.counters.renderedDots).toBe(1);
+      expect(engine.renderedDotsList[0].source).toBe('stylus_fallback');
+
+      // Case B: Normal dual stream (pointerdown + stylus touchstart arrive together)
+      engine.handlePointerEvent({
+        type: 'pointerdown',
+        pointerId: 11,
+        pointerType: 'pen',
+        clientX: 250,
+        clientY: 250,
+        pressure: 0.5,
+        timeStamp: 2000,
+      });
+      engine.handleTouchEvent({
+        type: 'touchstart',
+        identifier: 11,
+        touchType: 'stylus',
+        clientX: 250,
+        clientY: 250,
+        timeStamp: 2005,
+      });
+      engine.handlePointerEvent({
+        type: 'pointerup',
+        pointerId: 11,
+        pointerType: 'pen',
+        clientX: 250,
+        clientY: 250,
+        pressure: 0,
+        timeStamp: 2030,
+      });
+      engine.handleTouchEvent({
+        type: 'touchend',
+        identifier: 11,
+        touchType: 'stylus',
+        clientX: 250,
+        clientY: 250,
+        timeStamp: 2030,
+      });
+
+      // Total strokes should be 2 (1 from fallback, 1 from normal pen pointer), NOT 3!
+      expect(engine.counters.strokesCreated).toBe(2);
+      expect(engine.counters.renderedDots).toBe(2);
+      expect(engine.counters.fallbackStrokes).toBe(1);
     });
   });
 });
