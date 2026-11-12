@@ -1,6 +1,7 @@
 export interface WritingDiagnosticEvent {
   time: number;
-  type: 'down' | 'move' | 'up' | 'cancel' | 'lostcapture' | 'reject';
+  surfaceId: number;
+  type: 'down' | 'accept' | 'up' | 'cancel' | 'lostcapture' | 'reject';
   pointerId: number;
   pointerType: string;
   pressure: number;
@@ -37,12 +38,8 @@ export const writingDiagnostics = {
     }
   },
 
-  getRecentEvents(): readonly WritingDiagnosticEvent[] {
-    return ringBuffer;
-  },
-
-  clearEvents() {
-    ringBuffer.length = 0;
+  getRecentEvents(surfaceId: number): WritingDiagnosticEvent[] {
+    return ringBuffer.filter((event) => event.surfaceId === surfaceId);
   },
 
   notifySurfaceMounted(): number {

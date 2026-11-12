@@ -891,38 +891,22 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
   });
 
   describe('compatibility ballpoint renderer and writing diagnostics', () => {
-    it('records diagnostics events and tracks surface lifecycle', () => {
-      writingDiagnostics.clearEvents();
-      expect(writingDiagnostics.getRecentEvents()).toEqual([]);
+    it('separates diagnostic surfaces and distinguishes raw and accepted pointerdowns', () => {
+      const board = writingDiagnostics.notifySurfaceMounted();
+      const editor = writingDiagnostics.notifySurfaceMounted();
+      expect(editor).toBeGreaterThan(board);
+      expect(writingDiagnostics.getRecentEvents(board)).toEqual([]);
 
-      writingDiagnostics.record({
-        type: 'down',
-        pointerType: 'pen',
-        pointerId: 10,
-        pressure: 0.5,
-      });
-      writingDiagnostics.record({
-        type: 'reject',
-        pointerType: 'touch',
-        pointerId: 11,
-        pressure: 0,
-        reason: 'pen_active',
-      });
-      writingDiagnostics.record({
-        type: 'up',
-        pointerType: 'pen',
-        pointerId: 10,
-        pressure: 0.4,
-      });
+      const pen = { surfaceId: board, pointerType: 'pen', pointerId: 10, pressure: 0.5 };
+      writingDiagnostics.record({ ...pen, type: 'down' });
+      writingDiagnostics.record({ ...pen, type: 'down', surfaceId: editor });
+      writingDiagnostics.record({ ...pen, type: 'accept', sessionToken: 1 });
+      writingDiagnostics.record({ ...pen, type: 'up', sessionToken: 1 });
 
-      const events = writingDiagnostics.getRecentEvents();
-      expect(events.length).toBe(3);
-      expect(events[0].type).toBe('down');
-      expect(events[1].reason).toBe('pen_active');
-      expect(events[2].type).toBe('up');
-
-      const lifecycle = writingDiagnostics.notifySurfaceMounted();
-      expect(lifecycle).toBeGreaterThan(0);
+      expect(writingDiagnostics.getRecentEvents(board).map((event) => event.type)).toEqual([
+        'down', 'accept', 'up',
+      ]);
+      expect(writingDiagnostics.getRecentEvents(editor)).toHaveLength(1);
     });
 
     it('strokePath produces valid Path2D with ballpointModel normal and compatibility', () => {

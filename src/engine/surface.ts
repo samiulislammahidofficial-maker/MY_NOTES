@@ -157,8 +157,9 @@ export class InkSurface {
     startDoc: Pt;
   } | null = null;
 
+  readonly diagnosticId = writingDiagnostics.notifySurfaceMounted();
+
   constructor(private host: HTMLElement, private opts: SurfaceOptions) {
-    writingDiagnostics.notifySurfaceMounted();
     host.style.userSelect = 'none';
     host.style.webkitUserSelect = 'none';
     for (const c of [this.scene, this.live]) {
@@ -1029,6 +1030,7 @@ export class InkSurface {
         this.palmIds.add(e.pointerId);
         this.debugCounters.rejected++;
         writingDiagnostics.record({
+          surfaceId: this.diagnosticId,
           type: 'reject',
           pointerId: e.pointerId,
           pointerType: e.pointerType,
@@ -1042,6 +1044,7 @@ export class InkSurface {
     this.opts.onActivate?.();
     this.debugCounters.down++;
     writingDiagnostics.record({
+      surfaceId: this.diagnosticId,
       type: 'down',
       pointerId: e.pointerId,
       pointerType: e.pointerType,
@@ -1209,6 +1212,7 @@ export class InkSurface {
     if (action !== 'ink') {
       this.debugCounters.rejected++;
       writingDiagnostics.record({
+        surfaceId: this.diagnosticId,
         type: 'reject',
         pointerId: e.pointerId,
         pointerType: e.pointerType,
@@ -1228,6 +1232,7 @@ export class InkSurface {
     } else if (this.activeId !== null) {
       this.debugCounters.rejected++;
       writingDiagnostics.record({
+        surfaceId: this.diagnosticId,
         type: 'reject',
         pointerId: e.pointerId,
         pointerType: e.pointerType,
@@ -1246,7 +1251,8 @@ export class InkSurface {
     this.mode = mode;
     this.debugCounters.accepted++;
     writingDiagnostics.record({
-      type: 'down',
+      surfaceId: this.diagnosticId,
+      type: 'accept',
       pointerId: e.pointerId,
       pointerType: e.pointerType,
       pressure: e.pressure,
@@ -1546,6 +1552,7 @@ export class InkSurface {
     if (e.pointerId !== this.activeId || this.activeSessionToken <= 0) return;
     this.debugCounters.completed++;
     writingDiagnostics.record({
+      surfaceId: this.diagnosticId,
       type: 'up',
       pointerId: e.pointerId,
       pointerType: e.pointerType,
@@ -1612,6 +1619,7 @@ export class InkSurface {
     // Only cancel the session if the event belongs to the current active pointer
     if (e.pointerId === this.activeId) {
       writingDiagnostics.record({
+        surfaceId: this.diagnosticId,
         type: 'cancel',
         pointerId: e.pointerId,
         pointerType: e.pointerType,
@@ -1635,6 +1643,7 @@ export class InkSurface {
     }
     this.debugCounters.lostCapture++;
     writingDiagnostics.record({
+      surfaceId: this.diagnosticId,
       type: 'lostcapture',
       pointerId: e.pointerId,
       pointerType: e.pointerType,

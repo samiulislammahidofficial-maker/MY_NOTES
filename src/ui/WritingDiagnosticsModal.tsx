@@ -2,13 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Copy, Download, Trash2, X } from 'lucide-react';
 import { InkSurface } from '../engine/surface';
 import { writingDiagnostics } from '../engine/diagnostics';
+import type { InkStroke } from '../domain/types';
 import { useApp } from '../app/store';
 
 export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
   const tool = useApp((s) => s.tool);
   const boardHostRef = useRef<HTMLDivElement>(null);
   const surfRef = useRef<InkSurface | null>(null);
-  const [stats, setStats] = useState<any>(null);
+  const boardStrokes = useRef<InkStroke[]>([]);
+  const committedCount = useRef(0);
+  const penDownCounts = useRef({ insideBoard: 0, outsideBoard: 0 });
+  const [stats, setStats] = useState<ReturnType<InkSurface['getStats']> | null>(null);
   const [copied, setCopied] = useState(false);
   const [exported, setExported] = useState(false);
 
@@ -16,13 +20,24 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (!boardHostRef.current) return;
-    const surf = new InkSurface(boardHostRef.current, {
+    const host = boardHostRef.current;
+    const surf = new InkSurface(host, {
       getTool: () => useApp.getState().tool,
       getPaper: () => ({ color: '#16161A', template: 'blank' }),
       getLayers: () => [{ id: 'diag-layer', name: 'Diagnostics', visible: true, locked: false, opacity: 1 }],
       activeLayerId: () => 'diag-layer',
-      onStroke: () => {},
-      onEdit: () => {},
+      onStroke: (stroke) => {
+        committedCount.current++;
+        boardStrokes.current = [...boardStrokes.current, stroke];
+        surf.setStrokes(boardStrokes.current);
+      },
+      onEdit: (_label, remove, add) => {
+        const removedIds = new Set(remove.map((stroke) => stroke.id));
+        boardStrokes.current = [
+          ...boardStrokes.current.filter((stroke) => !removedIds.has(stroke.id)),
+          ...add,
+        ];
+      },
     });
     surf.setPage(
       {
@@ -36,6 +51,12 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
       [],
     );
     surfRef.current = surf;
+    const countPenDown = (event: PointerEvent) => {
+      if (event.pointerType !== 'pen') return;
+      const location = event.composedPath().includes(host) ? 'insideBoard' : 'outsideBoard';
+      penDownCounts.current[location]++;
+    };
+    window.addEventListener('pointerdown', countPenDown, true);
 
     const interval = setInterval(() => {
       if (surfRef.current) {
@@ -45,31 +66,31 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
 
     return () => {
       clearInterval(interval);
+      window.removeEventListener('pointerdown', countPenDown, true);
       surf.destroy();
       surfRef.current = null;
     };
   }, []);
 
-  const handleCopySummary = async () => {
-    const events = writingDiagnostics.getRecentEvents();
-    const summary = {
+  const getReport = () => {
+    const surface = surfRef.current;
+    return {
       buildId,
       time: new Date().toISOString(),
       ballpointModel: tool.ballpointModel ?? 'normal',
       penSmoothing: tool.penSmoothing ?? 'low',
       penOnly: tool.penOnly,
-      stats,
-      recentEventTypes: events.map((e) => ({
-        t: Math.round(e.time),
-        type: e.type,
-        pointerType: e.pointerType,
-        pointerId: e.pointerId,
-        p: +(e.pressure.toFixed(3)),
-        reason: e.reason,
-      })),
+      tool: tool.kind,
+      stats: surface?.getStats(),
+      committedStrokesSinceOpen: committedCount.current,
+      penDownsSinceOpen: { ...penDownCounts.current },
+      recentBoardEvents: surface ? writingDiagnostics.getRecentEvents(surface.diagnosticId) : [],
     };
+  };
+
+  const handleCopySummary = async () => {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
+      await navigator.clipboard.writeText(JSON.stringify(getReport(), null, 2));
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -78,8 +99,7 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
   };
 
   const handleExportTestSamples = () => {
-    const events = writingDiagnostics.getRecentEvents();
-    const json = JSON.stringify({ buildId, timestamp: Date.now(), events }, null, 2);
+    const json = JSON.stringify(getReport(), null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -92,7 +112,7 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
   };
 
   const handleClearBoard = () => {
-    writingDiagnostics.clearEvents();
+    boardStrokes.current = [];
     surfRef.current?.setStrokes([]);
   };
 
@@ -180,7 +200,7 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
             <div>
               <span style={{ color: 'var(--muted)' }}>Pressure (min/max):</span>{' '}
               <strong>
-                {stats?.debug?.maxPressure > 0
+                {stats && stats.debug.maxPressure > 0
                   ? `${stats.debug.minPressure.toFixed(2)} / ${stats.debug.maxPressure.toFixed(2)}`
                   : '—'}
               </strong>
@@ -189,6 +209,11 @@ export function WritingDiagnosticsModal({ onClose }: { onClose: () => void }) {
               <span style={{ color: 'var(--muted)' }}>Surface Lifecycle:</span>{' '}
               <strong>#{stats?.surfaceLifecycles ?? 1}</strong>
             </div>
+          </div>
+
+          <div style={{ fontSize: 12 }}>
+            Strokes on board {stats?.strokes ?? 0}. For a rapid-stroke test, reopen this dialog, draw 20 separate
+            pen marks without pausing, then export the report and include how many marks you attempted.
           </div>
 
           {/* Test Board Canvas */}
