@@ -9,6 +9,8 @@ type PathSrc = {
   width: number;
   tool?: InkStroke['tool'];
   smoothing?: number;
+  streamline?: number;
+  ballpointModel?: 'normal' | 'compatibility';
 };
 
 const MAX_PATH_CACHE = 2000;
@@ -18,9 +20,10 @@ const centerlinePathCache = new Map<string, Path2D>();
 /** Nib behaviour: ballpoint ~constant width; fountain = elliptical chisel; brush = strong pressure curve. */
 export function strokePath(s: PathSrc, complete = true): Path2D {
   const tool = s.tool ?? 'ballpoint';
+  const effectiveStreamline = s.streamline ?? s.smoothing;
   const cacheKey =
     complete && s.id
-      ? `${s.id}:${s.revision ?? 1}:${s.width}:${tool}:${s.smoothing ?? ''}:${s.samples.length}`
+      ? `${s.id}:${s.revision ?? 1}:${s.width}:${tool}:${effectiveStreamline ?? ''}:${s.ballpointModel ?? ''}:${s.samples.length}`
       : null;
   if (cacheKey && strokePathCache.has(cacheKey)) {
     return strokePathCache.get(cacheKey)!;
@@ -76,7 +79,7 @@ export function strokePath(s: PathSrc, complete = true): Path2D {
     size: tool === 'brush' ? s.width * 1.45 : s.width,
     thinning: cfg.thinning,
     smoothing: cfg.smoothing,
-    streamline: s.smoothing ?? cfg.streamline,
+    streamline: effectiveStreamline ?? cfg.streamline,
     simulatePressure: false,
     // Keep last: true for both live and committed so lifting the pen never causes a sudden curve/width jump!
     last: true,

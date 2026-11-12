@@ -5,10 +5,13 @@ export type Nib = 'ballpoint' | 'fountain' | 'brush';
 export type StrokeStyle = 'solid' | 'dashed' | 'dotted';
 export type ShapeKind = 'line' | 'rect' | 'ellipse';
 export type PenSmoothingLevel = 'off' | 'low' | 'medium';
+export type BallpointModel = 'normal' | 'compatibility';
 
 export interface ToolSettings {
   kind: ToolKind;
   nib: Nib;
+  /** 'normal' (perfect-freehand outline) vs 'compatibility' (constant-width Canvas2D centerline path) */
+  ballpointModel?: BallpointModel;
   strokeStyle: StrokeStyle;
   /** pen colour + width in document points */
   color: string;

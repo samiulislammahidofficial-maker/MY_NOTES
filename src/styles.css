@@ -1087,6 +1087,8 @@ button:disabled { opacity: .35; cursor: default; }
   display: flex;
   flex-direction: column;
   gap: 12px;
+  transform-origin: top center;
+  transition: max-width 0.12s ease-out;
 }
 .continuous-page-block {
   display: flex;

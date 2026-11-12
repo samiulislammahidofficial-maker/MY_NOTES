@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import {
+  Activity,
   CheckCircle2,
   Copy,
   Download,
@@ -16,6 +17,7 @@ import {
 } from 'lucide-react';
 import { actions, beginEssentialJob, useApp } from '../app/store';
 import type { PenSmoothingLevel } from '../engine/tools';
+import { WritingDiagnosticsModal } from './WritingDiagnosticsModal';
 import {
   LOCAL_PACK_APPROX_LABEL,
   cancelLocalPackInstall,
@@ -36,6 +38,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const restoreInputRef = useRef<HTMLInputElement>(null);
   const [busyMsg, setBusyMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [copiedVersion, setCopiedVersion] = useState(false);
   const [packInstalled, setPackInstalled] = useState(() => isLocalPackInstalled());
   const [packInstalling, setPackInstalling] = useState(false);
@@ -455,6 +458,51 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 />
               </svg>
             </div>
+
+            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>Ballpoint Renderer</span>
+                <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                  Active: <strong style={{ color: '#E5E5EA' }}>{(s.tool.ballpointModel ?? 'normal') === 'compatibility' ? 'Compatibility' : 'Normal'}</strong>
+                </span>
+              </div>
+              <div className="seg" role="radiogroup" aria-label="Ballpoint renderer engine">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={(s.tool.ballpointModel ?? 'normal') === 'normal'}
+                  className={(s.tool.ballpointModel ?? 'normal') === 'normal' ? 'on' : ''}
+                  onClick={() => actions.setTool({ ballpointModel: 'normal' })}
+                >
+                  Normal (Outlines)
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={(s.tool.ballpointModel ?? 'normal') === 'compatibility'}
+                  className={(s.tool.ballpointModel ?? 'normal') === 'compatibility' ? 'on' : ''}
+                  onClick={() => actions.setTool({ ballpointModel: 'compatibility' })}
+                >
+                  Compatibility (Centerline Baseline)
+                </button>
+              </div>
+              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                {(s.tool.ballpointModel ?? 'normal') === 'compatibility'
+                  ? 'Constant-width Canvas2D centerline path with round caps/joins. Direct, unbroken sample connection with no pressure/outline transforms.'
+                  : 'Dynamic outline mesh with gentle pressure response and physical ink taper.'}
+              </span>
+
+              <div style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  className="chip"
+                  onClick={() => setShowDiagnostics(true)}
+                  style={{ gap: 6, color: '#64D2FF', borderColor: 'rgba(100, 210, 255, 0.3)' }}
+                >
+                  <Activity size={14} /> Open Writing Diagnostics Board
+                </button>
+              </div>
+            </div>
           </section>
 
           {/* Section 3: Offline Handwriting Recognition Pack */}
@@ -626,6 +674,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </section>
         </div>
       </div>
+
+      {showDiagnostics && <WritingDiagnosticsModal onClose={() => setShowDiagnostics(false)} />}
     </div>
   );
 }

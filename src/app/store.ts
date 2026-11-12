@@ -113,6 +113,15 @@ const initialPenSmoothing = ((): 'off' | 'low' | 'medium' => {
   }
 })();
 
+const initialBallpointModel = ((): 'normal' | 'compatibility' => {
+  try {
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem('mynotes.ballpointModel') : null;
+    return v === 'compatibility' ? 'compatibility' : 'normal';
+  } catch {
+    return 'normal';
+  }
+})();
+
 const SESSION_STATE_KEY = 'mynotes.lastSessionState';
 const HISTORY_STORAGE_PREFIX = 'mynotes.history.';
 
@@ -176,7 +185,7 @@ export const useApp = create<State>(() => ({
   saveError: null,
   persisted: null,
   tool: {
-    kind: 'pen', nib: 'ballpoint', strokeStyle: 'solid', color: '#F4F436', rainbow: false, width: mmToPt(0.45), opacity: 1,
+    kind: 'pen', nib: 'ballpoint', ballpointModel: initialBallpointModel, strokeStyle: 'solid', color: '#F4F436', rainbow: false, width: mmToPt(0.45), opacity: 1,
     hlColor: '#FFE600', hlWidth: mmToPt(5), hlOpacity: 0.4,
     eraserMode: 'pixel', eraserRadius: 8, shape: 'line', scribbleErase: true, shapeSnap: true, rulerVisible: false, rulerUnits: 'metric', stabilizer: 0.3,
     penSmoothing: initialPenSmoothing,
@@ -1218,6 +1227,15 @@ export const actions = {
       try {
         if (typeof localStorage !== 'undefined') {
           localStorage.setItem('mynotes.penSmoothing', patch.penSmoothing);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    if (patch.ballpointModel) {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('mynotes.ballpointModel', patch.ballpointModel);
         }
       } catch {
         /* ignore */

@@ -18,6 +18,7 @@ import {
   unionBounds,
 } from './hit';
 import { detectScribble } from './scribble';
+import { writingDiagnostics } from './diagnostics';
 import type { LayerInfo, PaperSpec, SelectionInfo, ToolSettings } from './tools';
 
 export type { ToolSettings } from './tools';
@@ -89,9 +90,14 @@ export class InkSurface {
     down: 0,
     up: 0,
     cancel: 0,
+    lostCapture: 0,
     accepted: 0,
+    rejected: 0,
     completed: 0,
     lastGapMs: 0,
+    minPressure: 1,
+    maxPressure: 0,
+    sampleCount: 0,
   };
   private touches = new Map<number, { x: number; y: number }>();
   private activeId: number | null = null;
@@ -152,6 +158,7 @@ export class InkSurface {
   } | null = null;
 
   constructor(private host: HTMLElement, private opts: SurfaceOptions) {
+    writingDiagnostics.notifySurfaceMounted();
     host.style.userSelect = 'none';
     host.style.webkitUserSelect = 'none';
     for (const c of [this.scene, this.live]) {
@@ -247,6 +254,9 @@ export class InkSurface {
       p95Ms: a.length ? a[Math.floor(a.length * 0.95)] : 0,
       dpr: this.dpr,
       strokes: this.strokes.length,
+      activePointerType: this.activeType || 'none',
+      activeSessionToken: this.activeSessionToken,
+      surfaceLifecycles: writingDiagnostics.getLifecycleCount(),
       debug: { ...this.debugCounters },
     };
   }
@@ -454,7 +464,15 @@ export class InkSurface {
     const style = s.rainbowSeed !== undefined ? createRainbowStyle(ctx, s.samples, s.rainbowSeed, s.color) : s.color;
     // highlighter: one filled outline composited once -> no self-overlap blotches
     ctx.globalCompositeOperation = s.tool === 'highlighter' ? (dark ? 'screen' : 'multiply') : 'source-over';
-    if (s.strokeStyle && s.strokeStyle !== 'solid' && s.tool !== 'highlighter') {
+    const isCompat = s.ballpointModel === 'compatibility' || (!s.ballpointModel && s.tool === 'ballpoint' && this.opts.getTool().ballpointModel === 'compatibility');
+    if (isCompat && s.tool !== 'highlighter') {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = style;
+      ctx.lineWidth = s.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.stroke(centerlinePath(s.samples, s.id, s.revision));
+    } else if (s.strokeStyle && s.strokeStyle !== 'solid' && s.tool !== 'highlighter') {
       ctx.strokeStyle = style;
       ctx.lineWidth = s.width;
       ctx.lineCap = 'round';
@@ -662,7 +680,15 @@ export class InkSurface {
         const w = hl ? tool.hlWidth : tool.width;
         const style = !hl && tool.rainbow ? createRainbowStyle(ctx, sub, this.liveSeed, tool.color) : hl ? tool.hlColor : tool.color;
         ctx.globalAlpha = hl ? tool.hlOpacity : tool.opacity;
-        if (!hl && tool.strokeStyle !== 'solid') {
+        const isCompat = !hl && tool.nib === 'ballpoint' && tool.ballpointModel === 'compatibility';
+        if (isCompat) {
+          ctx.setLineDash([]);
+          ctx.strokeStyle = style;
+          ctx.lineWidth = w;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke(centerlinePath(sub));
+        } else if (!hl && tool.strokeStyle !== 'solid') {
           ctx.strokeStyle = style;
           ctx.lineWidth = w;
           ctx.lineCap = 'round';
@@ -674,7 +700,7 @@ export class InkSurface {
         } else {
           ctx.setLineDash([]);
           ctx.fillStyle = style;
-          ctx.fill(strokePath({ samples: sub, width: w, tool: hl ? 'highlighter' : tool.nib, smoothing: this.smoothing(tool) }, false));
+          ctx.fill(strokePath({ samples: sub, width: w, tool: hl ? 'highlighter' : tool.nib, smoothing: this.smoothing(tool), streamline: this.smoothing(tool) }, false));
         }
         ctx.globalAlpha = 1;
       }
@@ -1001,12 +1027,26 @@ export class InkSurface {
     if (e.pointerType === 'touch') {
       if (this.penDown || performance.now() - this.lastPenUp < 250) {
         this.palmIds.add(e.pointerId);
+        this.debugCounters.rejected++;
+        writingDiagnostics.record({
+          type: 'reject',
+          pointerId: e.pointerId,
+          pointerType: e.pointerType,
+          pressure: e.pressure,
+          reason: 'palm-rejection (pen down or guard window)',
+        });
         return;
       }
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     }
     this.opts.onActivate?.();
     this.debugCounters.down++;
+    writingDiagnostics.record({
+      type: 'down',
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      pressure: e.pressure,
+    });
     if (e.pointerType === 'pen') {
       // Pen takes ownership: drop any in-progress finger navigation state.
       this.navLast = null;
@@ -1166,7 +1206,17 @@ export class InkSurface {
       }
     }
 
-    if (action !== 'ink') return;
+    if (action !== 'ink') {
+      this.debugCounters.rejected++;
+      writingDiagnostics.record({
+        type: 'reject',
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        pressure: e.pressure,
+        reason: `arbitration-${action}`,
+      });
+      return;
+    }
 
     // For pen strokes, if another stroke was somehow still active (rapid pen strokes), finalize it immediately
     if (e.pointerType === 'pen' && this.activeId !== null) {
@@ -1176,6 +1226,14 @@ export class InkSurface {
         this.cancelSession();
       }
     } else if (this.activeId !== null) {
+      this.debugCounters.rejected++;
+      writingDiagnostics.record({
+        type: 'reject',
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        pressure: e.pressure,
+        reason: `activeId-busy-${this.activeId}`,
+      });
       return;
     }
 
@@ -1187,6 +1245,13 @@ export class InkSurface {
     this.activeType = e.pointerType;
     this.mode = mode;
     this.debugCounters.accepted++;
+    writingDiagnostics.record({
+      type: 'down',
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      pressure: e.pressure,
+      sessionToken: this.activeSessionToken,
+    });
     if (e.pointerType === 'pen') this.penDown = true;
     this.opts.onStrokeStart?.();
     if (mode !== 'lasso' && this.sel) this.clearSelection();
@@ -1298,6 +1363,11 @@ export class InkSurface {
         }
       }
       this.buf.push(d.x, d.y, p, ev.tiltX || 0, ev.tiltY || 0, tMs);
+      this.debugCounters.sampleCount++;
+      if (p > 0) {
+        this.debugCounters.minPressure = Math.min(this.debugCounters.minPressure, p);
+        this.debugCounters.maxPressure = Math.max(this.debugCounters.maxPressure, p);
+      }
     }
     clearTimeout(this.holdTimer);
     if (this.snappedShape && evs.length) {
@@ -1475,6 +1545,13 @@ export class InkSurface {
     }
     if (e.pointerId !== this.activeId || this.activeSessionToken <= 0) return;
     this.debugCounters.completed++;
+    writingDiagnostics.record({
+      type: 'up',
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      pressure: e.pressure,
+      sessionToken: this.activeSessionToken,
+    });
     const mode = this.mode;
     this.activeId = null;
     this.activeSessionToken = 0;
@@ -1534,6 +1611,13 @@ export class InkSurface {
     }
     // Only cancel the session if the event belongs to the current active pointer
     if (e.pointerId === this.activeId) {
+      writingDiagnostics.record({
+        type: 'cancel',
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        pressure: e.pressure,
+        sessionToken: this.activeSessionToken,
+      });
       this.cancelSession();
     }
   };
@@ -1549,6 +1633,15 @@ export class InkSurface {
     } catch {
       /* synthetic pointer */
     }
+    this.debugCounters.lostCapture++;
+    writingDiagnostics.record({
+      type: 'lostcapture',
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      pressure: e.pressure,
+      sessionToken: this.activeSessionToken,
+      reason: 'genuine-lost-pointer-capture',
+    });
     this.onCancel(e);
   };
 
@@ -1622,12 +1715,15 @@ export class InkSurface {
         if (hit.length) return this.applyEdit('Scribble erase', hit, []);
       }
     }
+    const isCompat = !hl && tool.nib === 'ballpoint' && tool.ballpointModel === 'compatibility';
     this.opts.onStroke({
       kind: 'stroke',
       id: crypto.randomUUID(),
       pageId: this.page.id,
       layerId: this.opts.activeLayerId() ?? this.page.layerIds[0],
       tool: hl ? 'highlighter' : tool.nib,
+      ballpointModel: isCompat ? 'compatibility' : 'normal',
+      streamline: this.smoothing(tool),
       strokeStyle: hl ? 'solid' : tool.strokeStyle,
       color: hl ? tool.hlColor : tool.color,
       rainbowSeed: !hl && tool.rainbow ? this.liveSeed : undefined,

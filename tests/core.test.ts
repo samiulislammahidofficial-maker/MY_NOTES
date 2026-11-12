@@ -7,9 +7,9 @@ Dexie.dependencies.indexedDB = indexedDB;
 Dexie.dependencies.IDBKeyRange = IDBKeyRange;
 
 // Provide realistic memory-backed sessionStorage for Node/test environment
-if (typeof window !== 'undefined' && (!window.sessionStorage || typeof window.sessionStorage.getItem !== 'function')) {
+const createMockStorage = (): Storage => {
   const store = new Map<string, string>();
-  const mockStorage: Storage = {
+  return {
     getItem: (key: string) => store.get(key) ?? null,
     setItem: (key: string, value: string) => { store.set(key, String(value)); },
     removeItem: (key: string) => { store.delete(key); },
@@ -17,10 +17,24 @@ if (typeof window !== 'undefined' && (!window.sessionStorage || typeof window.se
     key: (index: number) => Array.from(store.keys())[index] ?? null,
     get length() { return store.size; },
   };
-  Object.defineProperty(window, 'sessionStorage', { value: mockStorage, configurable: true });
-}
+};
+
 if (typeof globalThis !== 'undefined' && (!globalThis.sessionStorage || typeof globalThis.sessionStorage.getItem !== 'function')) {
-  Object.defineProperty(globalThis, 'sessionStorage', { value: window.sessionStorage, configurable: true });
+  const mockStorage = createMockStorage();
+  Object.defineProperty(globalThis, 'sessionStorage', { value: mockStorage, configurable: true, writable: true });
+}
+if (typeof window !== 'undefined' && (!window.sessionStorage || typeof window.sessionStorage.getItem !== 'function')) {
+  Object.defineProperty(window, 'sessionStorage', { value: globalThis.sessionStorage, configurable: true, writable: true });
+}
+if (typeof globalThis !== 'undefined' && typeof (globalThis as any).Path2D === 'undefined') {
+  class MockPath2D {
+    ops: any[] = [];
+    moveTo(x: number, y: number) { this.ops.push(['moveTo', x, y]); }
+    lineTo(x: number, y: number) { this.ops.push(['lineTo', x, y]); }
+    arc(x: number, y: number, r: number, s: number, e: number) { this.ops.push(['arc', x, y, r, s, e]); }
+    closePath() { this.ops.push(['closePath']); }
+  }
+  Object.defineProperty(globalThis, 'Path2D', { value: MockPath2D, configurable: true, writable: true });
 }
 import { clientToDoc, constrainView, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
 import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, UpdateImageBoxCommand, deserializeCommand, type StrokeTarget } from '../src/domain/history';
@@ -45,7 +59,8 @@ import {
   SwipeToAddController,
 } from '../src/engine/swipeAddPage';
 import { detectScribble } from '../src/engine/scribble';
-import { boundsOf } from '../src/engine/render';
+import { boundsOf, strokePath } from '../src/engine/render';
+import { writingDiagnostics } from '../src/engine/diagnostics';
 import { SAMPLE_STRIDE, type InkStroke } from '../src/domain/types';
 
 const rect = { left: 40, top: 20 };
@@ -874,6 +889,65 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
       expect(r2.shouldAddPage).toBe(true);
     });
   });
+
+  describe('compatibility ballpoint renderer and writing diagnostics', () => {
+    it('records diagnostics events and tracks surface lifecycle', () => {
+      writingDiagnostics.clearEvents();
+      expect(writingDiagnostics.getRecentEvents()).toEqual([]);
+
+      writingDiagnostics.record({
+        type: 'down',
+        pointerType: 'pen',
+        pointerId: 10,
+        pressure: 0.5,
+      });
+      writingDiagnostics.record({
+        type: 'reject',
+        pointerType: 'touch',
+        pointerId: 11,
+        pressure: 0,
+        reason: 'pen_active',
+      });
+      writingDiagnostics.record({
+        type: 'up',
+        pointerType: 'pen',
+        pointerId: 10,
+        pressure: 0.4,
+      });
+
+      const events = writingDiagnostics.getRecentEvents();
+      expect(events.length).toBe(3);
+      expect(events[0].type).toBe('down');
+      expect(events[1].reason).toBe('pen_active');
+      expect(events[2].type).toBe('up');
+
+      const lifecycle = writingDiagnostics.notifySurfaceMounted();
+      expect(lifecycle).toBeGreaterThan(0);
+    });
+
+    it('strokePath produces valid Path2D with ballpointModel normal and compatibility', () => {
+      // 3 points (stride 3: x, y, pressure)
+      const samples = new Float32Array([10, 10, 0.5, 20, 20, 0.6, 30, 25, 0.7]);
+      const normalPath = strokePath({
+        samples,
+        width: 2,
+        tool: 'ballpoint',
+        smoothing: 0.45,
+        ballpointModel: 'normal',
+      });
+      expect(normalPath).toBeInstanceOf(Path2D);
+
+      const compatPath = strokePath({
+        samples,
+        width: 2,
+        tool: 'ballpoint',
+        smoothing: 0.45,
+        ballpointModel: 'compatibility',
+      });
+      expect(compatPath).toBeInstanceOf(Path2D);
+    });
+  });
 });
+
 
 

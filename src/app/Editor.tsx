@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Activity,
   ChevronDown,
   ChevronLeft,
   ClipboardPaste,
@@ -63,6 +64,7 @@ import { PasswordModal, type PasswordModalMode } from '../ui/PasswordModal';
 import { blobStore, sha256Hex } from '../storage/blobStore';
 import { db } from '../storage/db';
 import { attachEditorSelectionGuard, clearWorkspaceStaleSelectionAndFocus } from '../engine/selectionGuard';
+import { WritingDiagnosticsModal } from '../ui/WritingDiagnosticsModal';
 
 const loadPdfManager = () => import('../pdf/pdfManager');
 const loadBackupManager = () => import('../export/backup');
@@ -589,8 +591,44 @@ function Pane({
   const [convertTarget, setConvertTarget] = useState<{ page: Page; strokes: InkStroke[] } | null>(null);
   const [tapBox, setTapBox] = useState<{ pageId: string; x: number; y: number; text: string } | null>(null);
   const [zoomScale, setZoomScale] = useState(1);
+  const [continuousScale, setContinuousScale] = useState(1);
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
   const [zoomWin, setZoomWin] = useState({ open: false, x: 40, y: 120, w: 200, h: 65, scale: 2.5 });
+  const activeTouchIdsRef = useRef<Set<number>>(new Set());
+  const isPenDownRef = useRef(false);
+
+  // Sync zoomScale to continuousScale when in continuous mode
+  useEffect(() => {
+    if (pageViewMode === 'continuous') {
+      setZoomScale(continuousScale);
+    }
+  }, [pageViewMode, continuousScale]);
+
+  const changeZoom = (factor: number) => {
+    if (pageViewMode === 'continuous') {
+      setContinuousScale((prev) => {
+        const next = Math.max(0.5, Math.min(3.0, prev * factor));
+        setZoomScale(next);
+        return next;
+      });
+    } else {
+      surf.current?.zoomByFactor(factor);
+    }
+  };
+
+  const resetFit = () => {
+    if (pageViewMode === 'continuous') {
+      setContinuousScale(1);
+      setZoomScale(1);
+      if (scrollWrapRef.current) {
+        const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
+        activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    } else {
+      surf.current?.fit();
+    }
+    setZoomMenuOpen(false);
+  };
 
   const syncRulerSurfaces = () => {
     surf.current?.invalidate();
@@ -865,6 +903,27 @@ function Pane({
         <div
           className="continuous-scroll-pane"
           ref={scrollWrapRef}
+          onPointerDown={(e) => {
+            if (e.pointerType === 'touch') {
+              activeTouchIdsRef.current.add(e.pointerId);
+            } else if (e.pointerType === 'pen') {
+              isPenDownRef.current = true;
+            }
+          }}
+          onPointerUp={(e) => {
+            if (e.pointerType === 'touch') {
+              activeTouchIdsRef.current.delete(e.pointerId);
+            } else if (e.pointerType === 'pen') {
+              isPenDownRef.current = false;
+            }
+          }}
+          onPointerCancel={(e) => {
+            if (e.pointerType === 'touch') {
+              activeTouchIdsRef.current.delete(e.pointerId);
+            } else if (e.pointerType === 'pen') {
+              isPenDownRef.current = false;
+            }
+          }}
           onScroll={(e) => {
             const wrap = e.currentTarget;
             const centerY = wrap.scrollTop + wrap.clientHeight * 0.35;
@@ -882,7 +941,13 @@ function Pane({
             }
           }}
         >
-          <div className="continuous-pages-stack">
+          <div
+            className="continuous-pages-stack"
+            style={{
+              maxWidth: `min(100%, ${Math.round(1400 * continuousScale)}px)`,
+              width: `${Math.round(100 * continuousScale)}%`,
+            }}
+          >
             {pages.map((pg, pageIdx) => {
               // Bounded canvas virtualization: mount active page ± 2 neighbors (minimum 5 pages) so long notebooks stay light
               const shouldMountCanvas = Math.abs(pageIdx - Math.max(0, idx)) <= 2;
@@ -943,13 +1008,15 @@ function Pane({
                       : undefined,
                 }}
                 onPointerDown={(e) => {
+                  if (e.pointerType === 'touch') activeTouchIdsRef.current.add(e.pointerId);
+                  const touches = Math.max(1, activeTouchIdsRef.current.size);
                   const snap = swipeCtrlRef.current.start({
                     pointerId: e.pointerId,
                     pointerType: e.pointerType,
                     clientY: e.clientY,
                     timeStamp: e.timeStamp,
-                    activeTouchCount: 1,
-                    penDown: false,
+                    activeTouchCount: touches,
+                    penDown: isPenDownRef.current,
                     rulerDragging: false,
                   });
                   setSwipeSnap(snap);
@@ -962,14 +1029,16 @@ function Pane({
                   }
                 }}
                 onPointerMove={(e) => {
+                  const touches = Math.max(1, activeTouchIdsRef.current.size);
                   const snap = swipeCtrlRef.current.move(e.pointerId, e.clientY, {
-                    activeTouchCount: 1,
-                    penDown: e.pointerType === 'pen',
+                    activeTouchCount: touches,
+                    penDown: isPenDownRef.current || e.pointerType === 'pen',
                     rulerDragging: false,
                   });
                   setSwipeSnap(snap);
                 }}
                 onPointerUp={(e) => {
+                  if (e.pointerType === 'touch') activeTouchIdsRef.current.delete(e.pointerId);
                   const res = swipeCtrlRef.current.end(e.pointerId, e.timeStamp);
                   setSwipeSnap(res.snapshot);
                   if (res.shouldAddPage) {
@@ -977,7 +1046,8 @@ function Pane({
                     void handleAddPageAfterAndScroll(lastId);
                   }
                 }}
-                onPointerCancel={() => {
+                onPointerCancel={(e) => {
+                  if (e.pointerType === 'touch') activeTouchIdsRef.current.delete(e.pointerId);
                   const snap = swipeCtrlRef.current.cancel();
                   setSwipeSnap(snap);
                 }}
@@ -1132,7 +1202,7 @@ function Pane({
                     className="icon xs"
                     aria-label="Zoom out"
                     title="Zoom out"
-                    onClick={() => surf.current?.zoomByFactor(0.85)}
+                    onClick={() => changeZoom(0.85)}
                   >
                     −
                   </button>
@@ -1140,22 +1210,14 @@ function Pane({
                     className="icon xs"
                     aria-label="Zoom in"
                     title="Zoom in"
-                    onClick={() => surf.current?.zoomByFactor(1.15)}
+                    onClick={() => changeZoom(1.15)}
                   >
                     +
                   </button>
                   <button
                     className="chip"
                     style={{ fontSize: 12, padding: '0 8px', minHeight: 28 }}
-                    onClick={() => {
-                      if (pageViewMode === 'continuous' && scrollWrapRef.current) {
-                        const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
-                        activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      } else {
-                        surf.current?.fit();
-                      }
-                      setZoomMenuOpen(false);
-                    }}
+                    onClick={resetFit}
                   >
                     Fit
                   </button>
@@ -1330,6 +1392,7 @@ export function Editor() {
   const editorRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   useEffect(() => {
     if (!editorRef.current) return;
@@ -1940,6 +2003,16 @@ export function Editor() {
             className="nav-row"
             onClick={() => {
               setPop(null);
+              setShowDiagnostics(true);
+            }}
+          >
+            <Activity size={16} /> <span>Stylus Diagnostics Board</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
               actions.openWelcome('how-it-works');
             }}
           >
@@ -2310,6 +2383,10 @@ export function Editor() {
             <X size={16} />
           </button>
         </div>
+      )}
+
+      {showDiagnostics && (
+        <WritingDiagnosticsModal onClose={() => setShowDiagnostics(false)} />
       )}
     </div>
   );
