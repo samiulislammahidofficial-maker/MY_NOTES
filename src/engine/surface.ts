@@ -19,6 +19,7 @@ import {
 } from './hit';
 import { detectScribble } from './scribble';
 import { writingDiagnostics } from './diagnostics';
+import { isDrawingOrManipulationTool } from './selectionGuard';
 import type { LayerInfo, PaperSpec, SelectionInfo, ToolSettings } from './tools';
 
 export type { ToolSettings } from './tools';
@@ -68,6 +69,7 @@ interface Selection {
 }
 
 const ID_T = { scale: 1, dx: 0, dy: 0, ax: 0, ay: 0 };
+const STYLUS_TOUCH_EVENTS = ['touchstart', 'touchmove', 'touchend'] as const;
 
 export class InkSurface {
   readonly scene = document.createElement('canvas');
@@ -175,6 +177,11 @@ export class InkSurface {
     this.live.addEventListener('pointerup', this.onUp);
     this.live.addEventListener('pointercancel', this.onCancel);
     this.live.addEventListener('lostpointercapture', this.onLostPointerCapture);
+    if (typeof Touch !== 'undefined' && 'touchType' in Touch.prototype) {
+      for (const type of STYLUS_TOUCH_EVENTS) {
+        this.live.addEventListener(type, this.preventStylusGesture, { passive: false });
+      }
+    }
     this.live.addEventListener('wheel', this.onWheel, { passive: false });
     this.live.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('mynotes:quiesce-for-update', this.onQuiesceForUpdate);
@@ -211,6 +218,9 @@ export class InkSurface {
     clearTimeout(this.holdTimer);
     cancelAnimationFrame(this.raf);
     this.ro.disconnect();
+    for (const type of STYLUS_TOUCH_EVENTS) {
+      this.live.removeEventListener(type, this.preventStylusGesture);
+    }
     window.removeEventListener('mynotes:quiesce-for-update', this.onQuiesceForUpdate);
     this.host.replaceChildren();
   }
@@ -1020,6 +1030,19 @@ export class InkSurface {
       default: return 'ink';
     }
   }
+
+  private preventStylusGesture = (event: TouchEvent) => {
+    if (!event.cancelable) return;
+    const { kind } = this.opts.getTool();
+    if (kind === 'hand' || !isDrawingOrManipulationTool(kind)) return;
+    // On iPadOS, cancel the browser's stylus gestures through Touch Events.
+    // Pointer Events still drive ink. Leave finger scroll/pinch and text input available.
+    const { changedTouches } = event;
+    for (const touch of changedTouches) {
+      if (!('touchType' in touch) || touch.touchType !== 'stylus') return;
+    }
+    if (changedTouches.length > 0) event.preventDefault();
+  };
 
   private onDown = (e: PointerEvent) => {
     // Palm rejection BEFORE any gesture recognition: while a pen owns the surface (or within
