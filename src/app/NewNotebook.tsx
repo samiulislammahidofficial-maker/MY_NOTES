@@ -27,6 +27,8 @@ export function NewNotebookDialog({ onClose }: { onClose: () => void }) {
   const [size, setSize] = useState<PaperSize>('A4');
   const [landscape, setLandscape] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const creatingRef = useRef(false);
   const coverInputRef = useRef<HTMLInputElement>(null);
 
   const addTag = () => {
@@ -59,7 +61,10 @@ export function NewNotebookDialog({ onClose }: { onClose: () => void }) {
   };
 
   const create = async () => {
+    if (creatingRef.current || busy) return;
+    creatingRef.current = true;
     setBusy(true);
+    setError(null);
     try {
       await actions.createNotebook(name.trim() || 'Untitled', true, {
         cover: cover.color,
@@ -72,7 +77,10 @@ export function NewNotebookDialog({ onClose }: { onClose: () => void }) {
         tags,
       });
       onClose();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to save notebook. Please try again.');
     } finally {
+      creatingRef.current = false;
       setBusy(false);
     }
   };
@@ -89,8 +97,14 @@ export function NewNotebookDialog({ onClose }: { onClose: () => void }) {
         <div className="modal-head">
           <button className="circle-btn" aria-label="Close" onClick={onClose}><X size={20} /></button>
           <h2>New Notebook</h2>
-          <button className="primary pill" disabled={busy} onClick={create}>Create</button>
+          <button className="primary pill" disabled={busy} onClick={create}>{busy ? 'Creating…' : 'Create'}</button>
         </div>
+        {error && (
+          <div role="alert" style={{ margin: '0 16px 8px', padding: '8px 12px', borderRadius: 8, background: 'rgba(255,69,58,0.14)', color: '#FF453A', fontSize: 13, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <span>{error}</span>
+            <button type="button" className="chip" onClick={create} disabled={busy}>Retry</button>
+          </div>
+        )}
         <div className="modal-top">
           <div className="previews">
             {hasCover && (

@@ -799,6 +799,7 @@ export const actions = {
   },
 
   async createNotebook(title = 'Untitled', open = true, o: NewNotebookOptions = {}): Promise<string> {
+    const tCreateStart = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const size = PAPER_SIZES[o.size ?? 'A4'];
     const landscape = o.landscape ?? false;
     const now = Date.now();
@@ -826,8 +827,30 @@ export const actions = {
       paper: o.paper ?? '#000000',
     };
     await repo.createNotebook(nb, page, layer);
-    set({ notebooks: await repo.allNotebooks() });
-    if (open) await actions.openNotebook(id);
+    const tIdbDone = typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+    // Merge new notebook into current library state and initialize caches directly
+    set((st) => ({
+      notebooks: [nb, ...st.notebooks.filter((n) => n.id !== nb.id)],
+    }));
+    pagesByNotebook.set(id, [page]);
+    pageNotebook.set(page.id, id);
+    strokesByPage.set(page.id, []);
+    textsByPage.set(page.id, []);
+    imagesByPage.set(page.id, []);
+    layersByPage.set(page.id, [layer]);
+
+    if (open) {
+      activateNotebookInEditor(id, [page]);
+      const tEditorReady = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      recordCreateTiming({
+        timestamp: new Date().toISOString(),
+        notebookId: id,
+        idbMs: Math.round(tIdbDone - tCreateStart),
+        editorReadyMs: Math.round(tEditorReady - tIdbDone),
+        totalMs: Math.round(tEditorReady - tCreateStart),
+      });
+    }
     return id;
   },
 
@@ -866,18 +889,7 @@ export const actions = {
   async openNotebook(id: string, pane?: number) {
     const pages = await actions.loadNotebook(id);
     if (!pages.length) return;
-    const nb = get().notebooks.find((n) => n.id === id);
-    const st = get();
-    const idx = pane ?? (st.mode === 'editor' ? st.activePane : 0);
-    const panes = [...st.panes];
-    panes[idx] = { notebookId: id, pageId: pages[0].id };
-    const tabs = st.tabs.includes(id) ? st.tabs : [...st.tabs, id];
-    const pageViewMode = nb?.pageViewMode ?? st.pageViewMode;
-    set({ mode: 'editor', panes, tabs, activePane: idx, paper: nb?.paper ?? '#000000', pageViewMode });
-    if (!nb?.passwordLock) {
-      saveLastSessionState({ mode: 'editor', notebookId: id, pageId: pages[0].id, pageViewMode });
-    }
-    refreshUndo();
+    activateNotebookInEditor(id, pages, pane);
   },
 
   closeTab(id: string) {
@@ -1423,4 +1435,54 @@ export const actions = {
     await actions.loadNotebook(nb.id);
   },
 };
+
+export interface NotebookCreateTiming {
+  timestamp: string;
+  notebookId: string;
+  idbMs: number;
+  editorReadyMs: number;
+  totalMs: number;
+}
+
+const CREATE_TIMINGS_KEY = 'mynotes.createTimings';
+
+export function getCreateTimings(): NotebookCreateTiming[] {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(CREATE_TIMINGS_KEY);
+      return raw ? JSON.parse(raw) : [];
+    }
+  } catch {
+    /* ignore */
+  }
+  return [];
+}
+
+function recordCreateTiming(entry: NotebookCreateTiming) {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const list = getCreateTimings();
+      list.push(entry);
+      if (list.length > 20) list.splice(0, list.length - 20);
+      localStorage.setItem(CREATE_TIMINGS_KEY, JSON.stringify(list));
+    }
+  } catch {
+    /* ignore storage errors */
+  }
+}
+
+function activateNotebookInEditor(id: string, pages: Page[], pane?: number) {
+  const nb = useApp.getState().notebooks.find((n) => n.id === id);
+  const st = useApp.getState();
+  const idx = pane ?? (st.mode === 'editor' ? st.activePane : 0);
+  const panes = [...st.panes];
+  panes[idx] = { notebookId: id, pageId: pages[0].id };
+  const tabs = st.tabs.includes(id) ? st.tabs : [...st.tabs, id];
+  const pageViewMode = nb?.pageViewMode ?? st.pageViewMode;
+  useApp.setState({ mode: 'editor', panes, tabs, activePane: idx, paper: nb?.paper ?? '#000000', pageViewMode });
+  if (!nb?.passwordLock) {
+    saveLastSessionState({ mode: 'editor', notebookId: id, pageId: pages[0].id, pageViewMode });
+  }
+  refreshUndo();
+}
 
