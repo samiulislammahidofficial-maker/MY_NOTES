@@ -248,10 +248,6 @@
       <span>
         👉 <span class="instructions-highlight">Test:</span> Make your physical pen marks (e.g. 26 or 40 marks), lifting the pen completely after each mark. No cap or stop condition is enforced.
       </span>
-      <label>
-        <input id="prevent-pen-gestures" type="checkbox" autocomplete="off">
-        Prevent system pen gestures (resets counters)
-      </label>
       <span id="status-hint" style="font-size: 12px; color: #A1A1A6;">Total Marks Captured: 0</span>
     </div>
 
@@ -279,7 +275,6 @@
         strokesCreated: 0,
         renderedDots: 0,
         fallbackStrokes: 0,
-        preventedStylusTouchEvents: 0,
       };
 
       const trace = [];
@@ -298,7 +293,6 @@
       const inpAttempted = document.getElementById('inp-attempted');
       const btnReset = document.getElementById('btn-reset');
       const btnDownload = document.getElementById('btn-download');
-      const preventPenGestures = document.getElementById('prevent-pen-gestures');
       const area = document.getElementById('test-area');
       const canvas = document.getElementById('test-canvas');
       const ctx = canvas.getContext('2d');
@@ -577,7 +571,7 @@
         }
       }, { passive: true });
 
-      function resetTest() {
+      btnReset.addEventListener('click', function () {
         counters.penPointerDown = 0;
         counters.penPointerMove = 0;
         counters.penPointerUp = 0;
@@ -590,7 +584,6 @@
         counters.strokesCreated = 0;
         counters.renderedDots = 0;
         counters.fallbackStrokes = 0;
-        counters.preventedStylusTouchEvents = 0;
 
         trace.length = 0;
         dots.length = 0;
@@ -599,31 +592,6 @@
         updateUI();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         logLine('Reset complete.');
-      }
-
-      function cancelStylusTouch(event) {
-        const touches = Array.from(event.changedTouches);
-        if (event.cancelable && touches.length > 0 && touches.every((touch) => touch.touchType === 'stylus')) {
-          event.preventDefault();
-          counters.preventedStylusTouchEvents++;
-        }
-      }
-
-      function updatePenGestureMode() {
-        for (const type of ['touchstart', 'touchmove', 'touchend']) {
-          if (preventPenGestures.checked) {
-            area.addEventListener(type, cancelStylusTouch, { passive: false });
-          } else {
-            area.removeEventListener(type, cancelStylusTouch);
-          }
-        }
-      }
-
-      btnReset.addEventListener('click', resetTest);
-      updatePenGestureMode();
-      preventPenGestures.addEventListener('change', function () {
-        updatePenGestureMode();
-        resetTest();
       });
 
       btnDownload.addEventListener('click', function () {
@@ -631,7 +599,6 @@
         const report = {
           exportedAt: new Date().toISOString(),
           attemptedMarks: attempted,
-          preventPenGestures: preventPenGestures.checked,
           counters: { ...counters },
           renderedDotsCount: dots.length,
           dots: dots,
