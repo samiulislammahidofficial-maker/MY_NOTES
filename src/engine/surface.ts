@@ -167,9 +167,10 @@ export class InkSurface {
         'position:absolute;inset:0;width:100%;height:100%;display:block;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none';
       host.appendChild(c);
     }
-    // In Continuous Scroll mode, use 'pan-y' without 'pinch-zoom' so the browser does not steal
-    // the gesture for whole-app visual viewport zoom. App-owned pinch is handled in surface.
-    this.live.style.touchAction = opts.disableCanvasPanWheel ? 'pan-y' : 'none';
+    // Always use touch-action: none on the live canvas so iPadOS/Android browsers never
+    // hijack vertical pen strokes or finger-drawing strokes with native pan-y scrolling.
+    // In Continuous Scroll mode, 1-finger touch panning scrolls the parent .continuous-scroll-pane.
+    this.live.style.touchAction = 'none';
     this.live.addEventListener('pointerdown', this.onDown);
     this.live.addEventListener('pointermove', this.onMove);
     this.live.addEventListener('pointerup', this.onUp);
@@ -1186,27 +1187,21 @@ export class InkSurface {
       guardMs: 250,
       touchCount: this.touches.size,
     });
-    if (mode === 'pan' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown && !this.opts.disableCanvasPanWheel) {
+    if (mode === 'pan' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown) {
       action = 'ink';
     }
 
     // 1-finger scrolling/panning in Pen-only mode (or when finger drawing is off)
     if (action === 'navigate' && e.pointerType === 'touch' && this.touches.size === 1 && !this.penDown) {
-      if (!this.opts.disableCanvasPanWheel) {
-        // In Single Page mode, surface handles 1-finger panning directly
-        e.preventDefault();
-        try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
-        this.activeId = e.pointerId;
-        this.activeSessionToken = ++this.sessionCounter;
-        this.sessionStartTs = e.timeStamp;
-        this.activeType = e.pointerType;
-        this.mode = 'pan';
-        this.panLast = { x: e.clientX, y: e.clientY };
-        return;
-      } else {
-        // In Continuous Scroll mode, let native touchAction ('pan-y pinch-zoom') handle vertical scroll smoothly
-        return;
-      }
+      e.preventDefault();
+      try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+      this.activeId = e.pointerId;
+      this.activeSessionToken = ++this.sessionCounter;
+      this.sessionStartTs = e.timeStamp;
+      this.activeType = e.pointerType;
+      this.mode = 'pan';
+      this.panLast = { x: e.clientX, y: e.clientY };
+      return;
     }
 
     if (action !== 'ink') {
@@ -1498,13 +1493,23 @@ export class InkSurface {
         break;
       case 'pan':
         if (this.panLast) {
-          this.view = this.applyBounds({
-            ...this.view,
-            tx: this.view.tx + e.clientX - this.panLast.x,
-            ty: this.view.ty + e.clientY - this.panLast.y,
-          });
+          const dx = e.clientX - this.panLast.x;
+          const dy = e.clientY - this.panLast.y;
+          if (this.opts.disableCanvasPanWheel) {
+            const scrollEl = this.host.closest('.continuous-scroll-pane') as HTMLElement | null;
+            if (scrollEl) {
+              scrollEl.scrollTop -= dy;
+              scrollEl.scrollLeft -= dx;
+            }
+          } else {
+            this.view = this.applyBounds({
+              ...this.view,
+              tx: this.view.tx + dx,
+              ty: this.view.ty + dy,
+            });
+            this.invalidate();
+          }
           this.panLast = { x: e.clientX, y: e.clientY };
-          this.invalidate();
         }
         break;
       case 'erase':

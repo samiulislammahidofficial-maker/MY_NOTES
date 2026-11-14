@@ -1075,10 +1075,14 @@ button:disabled { opacity: .35; cursor: default; }
   position: absolute;
   inset: 0;
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: auto;
   padding: 16px clamp(12px, 2.5vw, 24px) 96px;
   scroll-behavior: smooth;
   overscroll-behavior-y: contain;
+  scrollbar-width: none;
+}
+.continuous-scroll-pane::-webkit-scrollbar {
+  display: none;
 }
 .continuous-pages-stack {
   width: 100%;
@@ -1117,8 +1121,7 @@ button:disabled { opacity: .35; cursor: default; }
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 .continuous-page-card.active {
-  border-color: var(--accent);
-  box-shadow: 0 12px 34px rgba(10, 132, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 .continuous-canvas-host {
   position: absolute;
@@ -1259,4 +1262,148 @@ button:disabled { opacity: .35; cursor: default; }
   .swipe-add-progress-fill {
     transition: none;
   }
+}
+
+/* Bottom-left compact readout (e.g. "20% | 45 of 73") */
+.hud-left-readout {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  z-index: 14;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 11px;
+  border-radius: 10px;
+  background: rgba(28, 28, 32, 0.88);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #f5f5f7;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+}
+.hud-left-readout-sep {
+  width: 1px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Slim neutral vertical scroll thumb at far right of pane */
+.continuous-scroll-thumb-hit {
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  width: 22px;
+  z-index: 13;
+  cursor: pointer;
+  touch-action: none;
+  transition: opacity 0.25s ease;
+}
+.continuous-scroll-thumb {
+  position: absolute;
+  right: 4px;
+  width: 4px;
+  min-height: 28px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.45);
+  pointer-events: none;
+}
+
+/* More menu top shortcuts grid */
+.more-menu-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 4px 6px 8px;
+}
+.more-shortcut {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 4px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #f5f5f7;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.more-shortcut:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Customize Toolbar Panel beside tool rail */
+.customize-toolbar-panel {
+  position: absolute;
+  left: 62px;
+  top: 56px;
+  bottom: 16px;
+  width: min(320px, calc(100vw - 76px));
+  z-index: 35;
+  background: rgba(28, 28, 32, 0.96);
+  backdrop-filter: blur(18px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.customize-toolbar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.customize-toolbar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.customize-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+.switch-pill {
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: #3a3a3c;
+  border: none;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+.switch-pill.on {
+  background: #30d158;
+}
+.switch-pill::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ffffff;
+  transition: transform 0.15s ease;
+}
+.switch-pill.on::after {
+  transform: translateX(18px);
 }

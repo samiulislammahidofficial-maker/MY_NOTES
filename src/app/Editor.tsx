@@ -1,10 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
   Activity,
+  Check,
+  FilePlus2,
+  Grid,
+  Link2,
+  Maximize2,
+  Pin,
+  PinOff,
+  Search,
+  Share,
+  Sliders,
   ChevronDown,
   ChevronLeft,
   ClipboardPaste,
@@ -596,6 +606,8 @@ function Pane({
   const [zoomWin, setZoomWin] = useState({ open: false, x: 40, y: 120, w: 200, h: 65, scale: 2.5 });
   const activeTouchIdsRef = useRef<Set<number>>(new Set());
   const isPenDownRef = useRef(false);
+  const [scrollThumb, setScrollThumb] = useState({ topPct: 0, heightPct: 100, visible: false, hasOverflow: false });
+  const scrollFadeTimerRef = useRef<number>(0);
 
   // Sync zoomScale to continuousScale when in continuous mode
   useEffect(() => {
@@ -604,11 +616,38 @@ function Pane({
     }
   }, [pageViewMode, continuousScale]);
 
+  const updateScrollThumb = (wrap: HTMLDivElement) => {
+    const sh = wrap.scrollHeight;
+    const ch = wrap.clientHeight;
+    if (sh <= ch + 2) {
+      setScrollThumb({ topPct: 0, heightPct: 100, visible: false, hasOverflow: false });
+      return;
+    }
+    const heightPct = Math.max(8, (ch / sh) * 100);
+    const maxTop = 100 - heightPct;
+    const topPct = Math.min(maxTop, Math.max(0, (wrap.scrollTop / Math.max(1, sh - ch)) * maxTop));
+    setScrollThumb({ topPct, heightPct, visible: true, hasOverflow: true });
+    window.clearTimeout(scrollFadeTimerRef.current);
+    scrollFadeTimerRef.current = window.setTimeout(() => {
+      setScrollThumb((prev) => ({ ...prev, visible: false }));
+    }, 1200);
+  };
+
   const changeZoom = (factor: number) => {
     if (pageViewMode === 'continuous') {
+      const wrap = scrollWrapRef.current;
+      const centerRatio = wrap && wrap.scrollHeight > 0
+        ? (wrap.scrollTop + wrap.clientHeight / 2) / wrap.scrollHeight
+        : 0;
       setContinuousScale((prev) => {
-        const next = Math.max(0.5, Math.min(3.0, prev * factor));
+        const next = Math.max(0.2, Math.min(3.0, prev * factor));
         setZoomScale(next);
+        if (wrap) {
+          requestAnimationFrame(() => {
+            wrap.scrollTop = Math.max(0, centerRatio * wrap.scrollHeight - wrap.clientHeight / 2);
+            updateScrollThumb(wrap);
+          });
+        }
         return next;
       });
     } else {
@@ -618,11 +657,17 @@ function Pane({
 
   const resetFit = () => {
     if (pageViewMode === 'continuous') {
+      const wrap = scrollWrapRef.current;
+      const centerRatio = wrap && wrap.scrollHeight > 0
+        ? (wrap.scrollTop + wrap.clientHeight / 2) / wrap.scrollHeight
+        : 0;
       setContinuousScale(1);
       setZoomScale(1);
-      if (scrollWrapRef.current) {
-        const activeCard = scrollWrapRef.current.querySelector('.continuous-page-card.active') as HTMLElement | null;
-        activeCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (wrap) {
+        requestAnimationFrame(() => {
+          wrap.scrollTop = Math.max(0, centerRatio * wrap.scrollHeight - wrap.clientHeight / 2);
+          updateScrollThumb(wrap);
+        });
       }
     } else {
       surf.current?.fit();
@@ -926,18 +971,27 @@ function Pane({
           }}
           onScroll={(e) => {
             const wrap = e.currentTarget;
-            const centerY = wrap.scrollTop + wrap.clientHeight * 0.35;
+            updateScrollThumb(wrap);
+            const centerY = wrap.scrollTop + wrap.clientHeight * 0.5;
             const cards = wrap.querySelectorAll<HTMLElement>('.continuous-page-card');
+            let bestId: string | undefined;
+            let bestDist = Infinity;
             for (const c of cards) {
               const top = c.offsetTop;
               const bottom = top + c.offsetHeight;
               if (centerY >= top && centerY <= bottom) {
-                const pid = c.dataset.pageId;
-                if (pid && pid !== pane?.pageId) {
-                  actions.setPage(index, pid);
-                }
+                bestId = c.dataset.pageId;
                 break;
               }
+              const mid = (top + bottom) / 2;
+              const dist = Math.abs(centerY - mid);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestId = c.dataset.pageId;
+              }
+            }
+            if (bestId && bestId !== pane?.pageId) {
+              actions.setPage(index, bestId);
             }
           }}
         >
@@ -1122,6 +1176,54 @@ function Pane({
           onClose={() => setConvertTarget(null)}
           onConverted={() => surf.current?.clearSelection()}
         />
+      )}
+
+      {/* Compact bottom-left readout: "20% | 45 of 73" */}
+      <div className="hud-left-readout" aria-label="Zoom and page indicator">
+        <span>{Math.round(zoomScale * 100)}%</span>
+        <span className="hud-left-readout-sep" aria-hidden="true" />
+        <span>
+          {Math.max(1, idx + 1)} of {Math.max(1, pages.length)}
+        </span>
+      </div>
+
+      {/* Slim neutral vertical scroll thumb at far right in Continuous mode */}
+      {pageViewMode === 'continuous' && scrollThumb.hasOverflow && (
+        <div
+          className="continuous-scroll-thumb-hit"
+          style={{ opacity: scrollThumb.visible ? 1 : 0.25 }}
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            const wrap = scrollWrapRef.current;
+            if (!wrap) return;
+            e.preventDefault();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            const rect = e.currentTarget.getBoundingClientRect();
+            const scrub = (clientY: number) => {
+              const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+              wrap.scrollTop = ratio * Math.max(0, wrap.scrollHeight - wrap.clientHeight);
+              updateScrollThumb(wrap);
+            };
+            scrub(e.clientY);
+            const onMove = (ev: PointerEvent) => scrub(ev.clientY);
+            const onUp = () => {
+              window.removeEventListener('pointermove', onMove);
+              window.removeEventListener('pointerup', onUp);
+              window.removeEventListener('pointercancel', onUp);
+            };
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp);
+            window.addEventListener('pointercancel', onUp);
+          }}
+        >
+          <div
+            className="continuous-scroll-thumb"
+            style={{
+              top: `${scrollThumb.topPct}%`,
+              height: `${scrollThumb.heightPct}%`,
+            }}
+          />
+        </div>
       )}
 
       {/* Compact unified Tablet Bottom HUD (Non-overlapping & Responsive) */}
@@ -1373,7 +1475,64 @@ function LayersPanel({ pageId }: { pageId: string }) {
   );
 }
 
-type Pop = 'style' | 'wheel' | 'eraser' | 'shape' | 'more' | null;
+type ToolbarToolId =
+  | 'pen'
+  | 'highlighter'
+  | 'eraser'
+  | 'lasso'
+  | 'hand'
+  | 'laser'
+  | 'text'
+  | 'page'
+  | 'image'
+  | 'shape'
+  | 'insert';
+
+interface ToolbarItemConfig {
+  id: ToolbarToolId;
+  label: string;
+  visible: boolean;
+}
+
+const TOOLBAR_CONFIG_KEY = 'mynotes.toolbarConfig.v1';
+const PINNED_PAGES_KEY = 'mynotes.pinnedPages.v1';
+
+const DEFAULT_TOOLBAR_ITEMS: ToolbarItemConfig[] = [
+  { id: 'pen', label: 'Pen Tool', visible: true },
+  { id: 'highlighter', label: 'Highlighter Tool', visible: true },
+  { id: 'eraser', label: 'Eraser Tool', visible: true },
+  { id: 'lasso', label: 'Lasso Tool', visible: true },
+  { id: 'hand', label: 'Hand Tool', visible: true },
+  { id: 'laser', label: 'Presentation Tool', visible: true },
+  { id: 'text', label: 'Text Tool', visible: false },
+  { id: 'page', label: 'Page', visible: false },
+  { id: 'image', label: 'Image', visible: false },
+  { id: 'shape', label: 'Shape', visible: false },
+  { id: 'insert', label: 'Insert', visible: true },
+];
+
+function loadToolbarConfig(): ToolbarItemConfig[] {
+  try {
+    const raw = localStorage.getItem(TOOLBAR_CONFIG_KEY);
+    if (!raw) return DEFAULT_TOOLBAR_ITEMS;
+    const parsed = JSON.parse(raw) as ToolbarItemConfig[];
+    if (!Array.isArray(parsed) || parsed.length === 0) return DEFAULT_TOOLBAR_ITEMS;
+    const byId = new Map(parsed.map((x) => [x.id, x]));
+    const merged: ToolbarItemConfig[] = [];
+    for (const item of parsed) {
+      const def = DEFAULT_TOOLBAR_ITEMS.find((d) => d.id === item.id);
+      if (def) merged.push({ id: def.id, label: def.label, visible: !!item.visible });
+    }
+    for (const def of DEFAULT_TOOLBAR_ITEMS) {
+      if (!byId.has(def.id)) merged.push(def);
+    }
+    return merged;
+  } catch {
+    return DEFAULT_TOOLBAR_ITEMS;
+  }
+}
+
+type Pop = 'style' | 'wheel' | 'eraser' | 'shape' | 'more' | 'insert' | null;
 
 export function Editor() {
   const s = useApp();
@@ -1393,6 +1552,50 @@ export function Editor() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [toolbarItems, setToolbarItems] = useState<ToolbarItemConfig[]>(() => loadToolbarConfig());
+  const [showCustomizeToolbar, setShowCustomizeToolbar] = useState(false);
+  const [showFindModal, setShowFindModal] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [showPageJumpModal, setShowPageJumpModal] = useState(false);
+  const [jumpPageNum, setJumpPageNum] = useState('');
+  const [showResizeModal, setShowResizeModal] = useState(false);
+  const [showPaperModal, setShowPaperModal] = useState(false);
+  const [showGestureSettings, setShowGestureSettings] = useState(false);
+  const [showDocEditing, setShowDocEditing] = useState(false);
+  const [pinnedPages, setPinnedPages] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(PINNED_PAGES_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [copiedLinkMsg, setCopiedLinkMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TOOLBAR_CONFIG_KEY, JSON.stringify(toolbarItems));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [toolbarItems]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PINNED_PAGES_KEY, JSON.stringify(pinnedPages));
+    } catch {
+      // ignore
+    }
+  }, [pinnedPages]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const pageId = params.get('page');
+    const nbId = s.panes[s.activePane]?.notebookId;
+    if (pageId && nbId && getPages(nbId).some((p) => p.id === pageId)) {
+      actions.setPage(s.activePane, pageId);
+    }
+  }, [s.activePane, s.panes]);
 
   useEffect(() => {
     if (!editorRef.current) return;
@@ -1740,7 +1943,180 @@ export function Editor() {
       </header>
 
       {pop === 'more' && (
-        <div className="popover more-menu" role="menu" style={{ minWidth: 286 }}>
+        <div className="popover more-menu" role="menu" style={{ minWidth: 296 }}>
+          <div style={{ textAlign: 'center', fontWeight: 600, fontSize: 15, padding: '4px 0 8px' }}>
+            More
+          </div>
+          <div className="more-menu-grid">
+            <button
+              type="button"
+              className="more-shortcut"
+              onClick={() => {
+                setPop(null);
+                setShowPaperModal(true);
+              }}
+            >
+              <Grid size={18} />
+              <span>Paper</span>
+            </button>
+            <button
+              type="button"
+              className="more-shortcut"
+              onClick={() => {
+                setPop(null);
+                window.print();
+              }}
+            >
+              <Share size={18} />
+              <span>Share</span>
+            </button>
+            <button
+              type="button"
+              className="more-shortcut"
+              onClick={() => {
+                setPop(null);
+                setShowFindModal(true);
+              }}
+            >
+              <Search size={18} />
+              <span>Find</span>
+            </button>
+            <button
+              type="button"
+              className="more-shortcut"
+              onClick={() => {
+                setPop(null);
+                setJumpPageNum(String(curPageIdx + 1));
+                setShowPageJumpModal(true);
+              }}
+            >
+              <FilePlus2 size={18} />
+              <span>1 - {curPages.length}</span>
+            </button>
+          </div>
+
+          <div className="row" style={{ fontSize: 12, color: 'var(--muted)', paddingBottom: 2 }}>
+            Page
+          </div>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              if (!curPage) return;
+              setPinnedPages((prev) => ({ ...prev, [curPage.id]: !prev[curPage.id] }));
+              setPop(null);
+            }}
+          >
+            {curPage && pinnedPages[curPage.id] ? <PinOff size={16} /> : <Pin size={16} />}
+            <span>
+              {curPage && pinnedPages[curPage.id] ? `Unpin Page ${curPageIdx + 1}` : `Pin Page ${curPageIdx + 1}`}
+            </span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
+              setShowResizeModal(true);
+            }}
+          >
+            <Maximize2 size={16} />
+            <span>Expand &amp; Resize Page</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              if (!curPage || !curNb) return;
+              const url = `${window.location.origin}${window.location.pathname}?nb=${encodeURIComponent(curNb.id)}&page=${encodeURIComponent(curPage.id)}`;
+              void navigator.clipboard?.writeText(url);
+              setCopiedLinkMsg('Copied local page link (works on this device only).');
+              setTimeout(() => setCopiedLinkMsg(null), 3000);
+              setPop(null);
+            }}
+          >
+            <Link2 size={16} />
+            <span>Copy Page Link</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              if (!curPage) return;
+              if (!window.confirm(`Clear all ink on Page ${curPageIdx + 1}? You can undo this.`)) return;
+              const strokes = getStrokes(curPage.id);
+              if (strokes.length > 0) {
+                actions.commitEdit('Clear Page', strokes, []);
+              }
+              setPop(null);
+            }}
+          >
+            <Eraser size={16} />
+            <span>Clear Page</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            disabled={curPages.length <= 1}
+            onClick={() => {
+              if (!curPage || curPages.length <= 1) return;
+              if (!window.confirm(`Delete Page ${curPageIdx + 1}?`)) return;
+              void actions.deletePage(s.activePane, curPage.id);
+              setPop(null);
+            }}
+          >
+            <Trash2 size={16} />
+            <span>Delete Page</span>
+          </button>
+
+          <div className="row" style={{ fontSize: 12, color: 'var(--muted)', paddingTop: 6, paddingBottom: 2 }}>
+            Settings
+          </div>
+          <label className="nav-row" style={{ justifyContent: 'space-between', cursor: 'pointer' }}>
+            <span>Draw with Touch</span>
+            <input
+              type="checkbox"
+              className="switch-pill"
+              checked={T.fingerDrawing}
+              onChange={(e) => actions.setTool({ fingerDrawing: e.target.checked })}
+            />
+          </label>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
+              setShowGestureSettings(true);
+            }}
+          >
+            <Hand size={16} />
+            <span>Gesture Settings</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
+              setShowDocEditing(true);
+            }}
+          >
+            <Pen size={16} />
+            <span>Document Editing</span>
+          </button>
+          <button
+            role="menuitem"
+            className="nav-row"
+            onClick={() => {
+              setPop(null);
+              setShowCustomizeToolbar(true);
+            }}
+          >
+            <Sliders size={16} />
+            <span>Customize Toolbar</span>
+          </button>
+
+          <hr style={{ border: 0, borderTop: '1px solid var(--line)', margin: '6px 0' }} />
+
           <div className="row" style={{ fontSize: 12, color: 'var(--muted)', paddingBottom: 2 }}>
             Page View
           </div>
@@ -2031,19 +2407,58 @@ export function Editor() {
           >
             <LayoutGrid size={22} />
           </button>
-          {tbtn('pen', 'Pen', <Pen size={22} />, 'style', 'style')}
-          {tbtn('highlighter', 'Highlighter', <Highlighter size={22} />, 'style', 'style')}
-          {tbtn('eraser', 'Eraser', <Eraser size={22} />, 'eraser')}
-          {tbtn('lasso', 'Lasso', <Lasso size={22} />)}
-          {tbtn('text', 'Text box & Scribble', <Type size={22} />)}
-          <button
-            className="tool"
-            aria-label="Insert image"
-            title="Insert image (question photo, diagram, scan)"
-            onClick={() => imageInputRef.current?.click()}
-          >
-            <ImageIcon size={22} />
-          </button>
+          {toolbarItems
+            .filter((item) => item.visible)
+            .map((item) => {
+              switch (item.id) {
+                case 'pen':
+                  return <Fragment key="pen">{tbtn('pen', 'Pen', <Pen size={22} />, 'style', 'style')}</Fragment>;
+                case 'highlighter':
+                  return (
+                    <Fragment key="highlighter">
+                      {tbtn('highlighter', 'Highlighter', <Highlighter size={22} />, 'style', 'style')}
+                    </Fragment>
+                  );
+                case 'eraser':
+                  return <Fragment key="eraser">{tbtn('eraser', 'Eraser', <Eraser size={22} />, 'eraser')}</Fragment>;
+                case 'lasso':
+                  return <Fragment key="lasso">{tbtn('lasso', 'Lasso', <Lasso size={22} />)}</Fragment>;
+                case 'hand':
+                  return <Fragment key="hand">{tbtn('hand', 'Hand', <Hand size={22} />)}</Fragment>;
+                case 'laser':
+                  return <Fragment key="laser">{tbtn('laser', 'Laser Pointer', <Sparkles size={22} />)}</Fragment>;
+                case 'text':
+                  return <Fragment key="text">{tbtn('text', 'Text box & Scribble', <Type size={22} />)}</Fragment>;
+                case 'shape':
+                  return <Fragment key="shape">{tbtn('shape', 'Shape', <Shapes size={22} />)}</Fragment>;
+                case 'page':
+                  return (
+                    <button
+                      key="page"
+                      className="tool"
+                      aria-label="Add page"
+                      title="Add page"
+                      onClick={() => void actions.addPage(s.activePane)}
+                    >
+                      <FilePlus2 size={22} />
+                    </button>
+                  );
+                case 'image':
+                  return (
+                    <button
+                      key="image"
+                      className="tool"
+                      aria-label="Insert image"
+                      title="Insert image (question photo, diagram, scan)"
+                      onClick={() => imageInputRef.current?.click()}
+                    >
+                      <ImageIcon size={22} />
+                    </button>
+                  );
+                default:
+                  return null;
+              }
+            })}
           <input
             ref={imageInputRef}
             type="file"
@@ -2387,6 +2802,276 @@ export function Editor() {
 
       {showDiagnostics && (
         <WritingDiagnosticsModal onClose={() => setShowDiagnostics(false)} />
+      )}
+
+      {showCustomizeToolbar && (
+        <div className="customize-toolbar-panel" role="dialog" aria-label="Customize Toolbar">
+          <div className="customize-toolbar-head">
+            <button
+              type="button"
+              className="chip"
+              onClick={() => setToolbarItems(DEFAULT_TOOLBAR_ITEMS)}
+            >
+              Reset
+            </button>
+            <strong style={{ fontSize: 15 }}>Customize</strong>
+            <button
+              type="button"
+              className="icon blue"
+              aria-label="Done customizing toolbar"
+              onClick={() => setShowCustomizeToolbar(false)}
+            >
+              <Check size={18} />
+            </button>
+          </div>
+          <div className="customize-toolbar-list">
+            {toolbarItems.map((item, idx) => (
+              <div key={item.id} className="customize-toolbar-row">
+                <span style={{ flex: 1, fontSize: 13 }}>{item.label}</span>
+                <input
+                  type="checkbox"
+                  className="switch-pill"
+                  aria-label={`Toggle ${item.label}`}
+                  checked={item.visible}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setToolbarItems((prev) =>
+                      prev.map((t) => (t.id === item.id ? { ...t, visible: checked } : t)),
+                    );
+                  }}
+                />
+                <button
+                  type="button"
+                  className="icon xs"
+                  aria-label={`Move ${item.label} up`}
+                  disabled={idx === 0}
+                  onClick={() => {
+                    setToolbarItems((prev) => {
+                      const next = [...prev];
+                      const [moved] = next.splice(idx, 1);
+                      next.splice(idx - 1, 0, moved);
+                      return next;
+                    });
+                  }}
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  className="icon xs"
+                  aria-label={`Move ${item.label} down`}
+                  disabled={idx === toolbarItems.length - 1}
+                  onClick={() => {
+                    setToolbarItems((prev) => {
+                      const next = [...prev];
+                      const [moved] = next.splice(idx, 1);
+                      next.splice(idx + 1, 0, moved);
+                      return next;
+                    });
+                  }}
+                >
+                  ↓
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showFindModal && (
+        <div className="modal-back" onClick={() => setShowFindModal(false)}>
+          <div className="modal" style={{ maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px' }}>Find in Notebook</h3>
+            <input
+              type="text"
+              className="input"
+              placeholder="Search text items..."
+              value={findQuery}
+              onChange={(e) => setFindQuery(e.target.value)}
+              autoFocus
+            />
+            <div style={{ maxHeight: 200, overflowY: 'auto', marginTop: 10 }}>
+              {findQuery.trim()
+                ? curPages
+                    .map((p, idx) => {
+                      const hit = getTexts(p.id).find((it) =>
+                        it.text.toLowerCase().includes(findQuery.toLowerCase()),
+                      );
+                      return hit ? { page: p, idx } : null;
+                    })
+                    .filter((x): x is { page: (typeof curPages)[number]; idx: number } => Boolean(x))
+                    .map(({ page, idx }) => (
+                      <button
+                        key={page.id}
+                        type="button"
+                        className="nav-row"
+                        onClick={() => {
+                          actions.setPage(s.activePane, page.id);
+                          setShowFindModal(false);
+                        }}
+                      >
+                        <span>Page {idx + 1}</span>
+                      </button>
+                    ))
+                : null}
+            </div>
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button type="button" className="btn" onClick={() => setShowFindModal(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showPageJumpModal && (
+        <div className="modal-back" onClick={() => setShowPageJumpModal(false)}>
+          <div className="modal" style={{ maxWidth: 320 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px' }}>Go to Page (1 - {curPages.length})</h3>
+            <input
+              type="number"
+              className="input"
+              min={1}
+              max={curPages.length}
+              value={jumpPageNum}
+              onChange={(e) => setJumpPageNum(e.target.value)}
+              autoFocus
+            />
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12, gap: 8 }}>
+              <button type="button" className="btn" onClick={() => setShowPageJumpModal(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => {
+                  const n = Number.parseInt(jumpPageNum, 10);
+                  if (Number.isFinite(n) && n >= 1 && n <= curPages.length) {
+                    actions.setPage(s.activePane, curPages[n - 1].id);
+                  }
+                  setShowPageJumpModal(false);
+                }}
+              >
+                Go
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showResizeModal && curPage && (
+        <div className="modal-back" onClick={() => setShowResizeModal(false)}>
+          <div className="modal" style={{ maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 8px' }}>Expand &amp; Resize Page</h3>
+            <p style={{ fontSize: 12, color: 'var(--muted)', margin: '0 0 12px' }}>
+              Current page size: {curPage.width} × {curPage.height} px. Expanding preserves all existing ink and items in place; shrinking below existing strokes may clip content outside the new bounds.
+            </p>
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button type="button" className="btn" onClick={() => setShowResizeModal(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showPaperModal && curPage && (
+        <div className="modal-back" onClick={() => setShowPaperModal(false)}>
+          <div className="modal" style={{ maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px' }}>Paper Template</h3>
+            <div style={{ display: 'grid', gap: 6 }}>
+              {(['blank', 'ruled', 'grid', 'dotted', 'cornell'] as const).map((tpl) => (
+                <button
+                  key={tpl}
+                  type="button"
+                  className="nav-row"
+                  onClick={() => {
+                    actions.setPaper(tpl);
+                    setShowPaperModal(false);
+                  }}
+                >
+                  <span style={{ textTransform: 'capitalize' }}>{tpl}</span>
+                </button>
+              ))}
+            </div>
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+              <button type="button" className="btn" onClick={() => setShowPaperModal(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showGestureSettings && (
+        <div className="modal-back" onClick={() => setShowGestureSettings(false)}>
+          <div className="modal" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px' }}>Gesture Settings</h3>
+            <label className="row" style={{ justifyContent: 'space-between' }}>
+              <span>Draw with Touch</span>
+              <input
+                type="checkbox"
+                className="switch-pill"
+                checked={T.fingerDrawing}
+                onChange={(e) => actions.setTool({ fingerDrawing: e.target.checked })}
+              />
+            </label>
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
+              <button type="button" className="btn" onClick={() => setShowGestureSettings(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDocEditing && (
+        <div className="modal-back" onClick={() => setShowDocEditing(false)}>
+          <div className="modal" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 10px' }}>Document Editing</h3>
+            <label className="row">
+              <input
+                type="checkbox"
+                checked={T.scribbleErase}
+                onChange={(e) => actions.setTool({ scribbleErase: e.target.checked })}
+              />{' '}
+              Scribble to erase
+            </label>
+            <label className="row">
+              <input
+                type="checkbox"
+                checked={T.shapeSnap}
+                onChange={(e) => actions.setTool({ shapeSnap: e.target.checked })}
+              />{' '}
+              Draw &amp; hold shape snap
+            </label>
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
+              <button type="button" className="btn" onClick={() => setShowDocEditing(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {copiedLinkMsg && (
+        <div
+          role="status"
+          style={{
+            position: 'fixed',
+            bottom: 64,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(28, 28, 30, 0.94)',
+            color: '#f5f5f7',
+            padding: '8px 14px',
+            borderRadius: 999,
+            fontSize: 12,
+            zIndex: 300,
+          }}
+        >
+          {copiedLinkMsg}
+        </div>
       )}
     </div>
   );
