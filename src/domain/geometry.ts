@@ -1,6 +1,6 @@
 import type { ViewMatrix } from './types';
 
-export const MIN_SCALE = 0.25;
+export const MIN_SCALE = 0.15;
 export const MAX_SCALE = 4;
 
 export function clampScale(s: number): number {

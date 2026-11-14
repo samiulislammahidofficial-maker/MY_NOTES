@@ -288,39 +288,6 @@ export function StyleColorPopover({
                   );
                 })}
               </div>
-
-              {t.nib === 'ballpoint' && (
-                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: 12, color: '#D1D1D6' }}>Ballpoint Model</span>
-                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-                      {(t.ballpointModel ?? 'normal') === 'compatibility' ? 'Compatibility' : 'Normal'}
-                    </span>
-                  </div>
-                  <div className="seg" role="radiogroup" aria-label="Ballpoint model" style={{ margin: 0 }}>
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={(t.ballpointModel ?? 'normal') === 'normal'}
-                      className={(t.ballpointModel ?? 'normal') === 'normal' ? 'on' : ''}
-                      onClick={() => actions.setTool({ ballpointModel: 'normal' })}
-                      style={{ fontSize: 11, minHeight: 28 }}
-                    >
-                      Normal
-                    </button>
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={(t.ballpointModel ?? 'normal') === 'compatibility'}
-                      className={(t.ballpointModel ?? 'normal') === 'compatibility' ? 'on' : ''}
-                      onClick={() => actions.setTool({ ballpointModel: 'compatibility' })}
-                      style={{ fontSize: 11, minHeight: 28 }}
-                    >
-                      Compatibility
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
 
             <div className="scp-divider" />

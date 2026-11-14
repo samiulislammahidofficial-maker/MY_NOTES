@@ -62,7 +62,9 @@ import { detectScribble } from '../src/engine/scribble';
 import { boundsOf, strokePath } from '../src/engine/render';
 import { writingDiagnostics } from '../src/engine/diagnostics';
 import { PenDiagnosticEngine } from '../src/engine/penDiagnosticEngine';
-import { SAMPLE_STRIDE, type InkStroke } from '../src/domain/types';
+import { exportNotebookToPdfBytes, exportPageToJpgBytes, parsePageRange } from '../src/pdf/pdfManager';
+import { PDFDocument } from 'pdf-lib';
+import { SAMPLE_STRIDE, type InkStroke, type Layer, type Notebook, type Page } from '../src/domain/types';
 
 const rect = { left: 40, top: 20 };
 
@@ -1142,6 +1144,90 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
       expect(engine.counters.strokesCreated).toBe(2);
       expect(engine.counters.renderedDots).toBe(2);
       expect(engine.counters.fallbackStrokes).toBe(1);
+    });
+  });
+
+  describe('Share PDF/JPG export and page range parsing', () => {
+    it('parsePageRange parses single pages, ranges, and clamps out-of-bounds indices', () => {
+      expect(parsePageRange('1', 5)).toEqual([0]);
+      expect(parsePageRange('2-4', 5)).toEqual([1, 2, 3]);
+      expect(parsePageRange('5, 1, 2-3, 99', 5)).toEqual([0, 1, 2, 4]);
+      expect(parsePageRange('invalid', 5)).toEqual([]);
+    });
+
+    it('exportNotebookToPdfBytes honors selected page subset and dimensions', async () => {
+      const nb: Notebook = {
+        id: 'nb-export',
+        title: 'Export Test',
+        cover: '#385e51',
+        hasCover: false,
+        template: 'ruled',
+        size: 'A4',
+        landscape: false,
+        folderId: null,
+        tags: [],
+        pinned: false,
+        trashedAt: null,
+        pageIds: ['p1', 'p2', 'p3'],
+        createdAt: 1,
+        updatedAt: 1,
+        revision: 1,
+        paper: '#FFFFFF',
+      };
+      const pages: Page[] = [
+        { id: 'p1', notebookId: nb.id, width: 595, height: 842, layerIds: ['l1'], revision: 1 },
+        { id: 'p2', notebookId: nb.id, width: 595, height: 842, layerIds: ['l2'], revision: 1 },
+        { id: 'p3', notebookId: nb.id, width: 842, height: 595, layerIds: ['l3'], revision: 1 },
+      ];
+      const layers: Record<string, Layer[]> = {
+        p1: [{ id: 'l1', pageId: 'p1', name: 'Ink', visible: true, locked: false, opacity: 1 }],
+        p2: [{ id: 'l2', pageId: 'p2', name: 'Ink', visible: true, locked: false, opacity: 1 }],
+        p3: [{ id: 'l3', pageId: 'p3', name: 'Ink', visible: true, locked: false, opacity: 1 }],
+      };
+      const bytes = await exportNotebookToPdfBytes(
+        nb,
+        [pages[1], pages[2]],
+        () => [mk('s1')],
+        () => [],
+        (pid) => layers[pid] ?? [],
+        () => [],
+      );
+      const parsed = await PDFDocument.load(bytes);
+      expect(parsed.getPageCount()).toBe(2);
+      expect(Math.round(parsed.getPage(0).getWidth())).toBe(595);
+      expect(Math.round(parsed.getPage(1).getWidth())).toBe(842);
+    });
+
+    it('exportPageToJpgBytes produces valid JPEG header bytes', async () => {
+      const nb: Notebook = {
+        id: 'nb-jpg',
+        title: 'JPG Test',
+        cover: '#385e51',
+        hasCover: false,
+        template: 'blank',
+        size: 'A4',
+        landscape: false,
+        folderId: null,
+        tags: [],
+        pinned: false,
+        trashedAt: null,
+        pageIds: ['p1'],
+        createdAt: 1,
+        updatedAt: 1,
+        revision: 1,
+        paper: '#FFFFFF',
+      };
+      const page: Page = { id: 'p1', notebookId: nb.id, width: 595, height: 842, layerIds: ['l1'], revision: 1 };
+      const bytes = await exportPageToJpgBytes(
+        nb,
+        page,
+        [mk('s1')],
+        [],
+        [{ id: 'l1', pageId: 'p1', name: 'Ink', visible: true, locked: false, opacity: 1 }],
+      );
+      expect(bytes.byteLength).toBeGreaterThan(2);
+      expect(bytes[0]).toBe(0xff);
+      expect(bytes[1]).toBe(0xd8);
     });
   });
 });

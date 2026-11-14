@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   BookOpen,
-  CheckCircle2,
-  Download,
   ExternalLink,
   Mail,
   PenTool,
@@ -12,14 +10,6 @@ import {
   Tablet,
 } from 'lucide-react';
 import { actions, useApp } from './store';
-
-const TUTORIAL_CACHE_NAME = 'my-notes-tutorial-v1';
-const TUTORIAL_FILES = [
-  '/tutorial/my-notes-tutorial.mp4',
-  '/tutorial/poster.png',
-  '/tutorial/captions.en.vtt',
-  '/tutorial/captions.bn.vtt',
-];
 
 const STORYBOARD_SCENES = [
   {
@@ -69,9 +59,6 @@ export function Welcome() {
   const [videoError, setVideoError] = useState(false);
   const [videoReloadKey, setVideoReloadKey] = useState(0);
   const [videoDuration, setVideoDuration] = useState('~1m 24s');
-  const [offlineState, setOfflineState] = useState<'idle' | 'downloading' | 'ready' | 'error'>('idle');
-  const [offlineProgress, setOfflineProgress] = useState(0);
-  const [offlineSizeKb, setOfflineSizeKb] = useState<number | null>(null);
 
   useEffect(() => {
     if (anchor === 'how-it-works') {
@@ -84,27 +71,7 @@ export function Welcome() {
   }, [anchor]);
 
   // Check if tutorial video is already cached for offline viewing
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      try {
-        if (!('caches' in window)) return;
-        const cache = await caches.open(TUTORIAL_CACHE_NAME);
-        const match = await cache.match('/tutorial/my-notes-tutorial.mp4');
-        if (match && active) {
-          const buf = await match.clone().arrayBuffer();
-          setOfflineSizeKb(Math.max(1, Math.round(buf.byteLength / 1024)));
-          setOfflineState('ready');
-          setOfflineProgress(100);
-        }
-      } catch {
-        /* ignore */
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
+
 
   const handleWatchDemo = () => {
     howRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -114,33 +81,6 @@ export function Welcome() {
         /* user can click play manually */
       });
     }, 250);
-  };
-
-  const handleDownloadOfflineTutorial = async () => {
-    if (!('caches' in window)) {
-      setOfflineState('error');
-      return;
-    }
-    setOfflineState('downloading');
-    setOfflineProgress(5);
-    try {
-      const cache = await caches.open(TUTORIAL_CACHE_NAME);
-      let totalBytes = 0;
-      for (let i = 0; i < TUTORIAL_FILES.length; i++) {
-        const url = TUTORIAL_FILES[i];
-        const res = await fetch(url, { cache: 'reload' });
-        if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-        const clone = res.clone();
-        const buf = await res.arrayBuffer();
-        totalBytes += buf.byteLength;
-        await cache.put(url, clone);
-        setOfflineProgress(Math.round(((i + 1) / TUTORIAL_FILES.length) * 100));
-      }
-      setOfflineSizeKb(Math.max(1, Math.round(totalBytes / 1024)));
-      setOfflineState('ready');
-    } catch {
-      setOfflineState('error');
-    }
   };
 
   return (
@@ -215,6 +155,8 @@ export function Welcome() {
                 ref={videoRef}
                 className="welcome-video"
                 controls
+                controlsList="nodownload"
+                onContextMenu={(e) => e.preventDefault()}
                 playsInline
                 preload="metadata"
                 poster="/tutorial/poster.png"
@@ -265,29 +207,6 @@ export function Welcome() {
             <div className="welcome-video-bar">
               <div className="welcome-video-meta">
                 <span>Duration: {videoDuration} • Captions: English &amp; বাংলা</span>
-                {offlineSizeKb && <span> • Local cache size: {offlineSizeKb} KB</span>}
-              </div>
-              <div className="welcome-video-actions">
-                {offlineState === 'ready' ? (
-                  <span className="welcome-offline-ready">
-                    <CheckCircle2 size={16} color="#30D158" /> Saved for offline viewing
-                    {offlineSizeKb ? ` (${offlineSizeKb} KB)` : ''}
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    className="chip"
-                    disabled={offlineState === 'downloading'}
-                    onClick={() => void handleDownloadOfflineTutorial()}
-                  >
-                    <Download size={15} />{' '}
-                    {offlineState === 'downloading'
-                      ? `Downloading (${offlineProgress}%)…`
-                      : offlineState === 'error'
-                        ? 'Retry Offline Download'
-                        : 'Download tutorial for offline viewing'}
-                  </button>
-                )}
               </div>
             </div>
           </div>
@@ -339,6 +258,22 @@ export function Welcome() {
                   browser storage resets.
                 </li>
               </ol>
+              <p
+                style={{
+                  marginTop: 12,
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  background: 'rgba(255, 255, 255, 0.05)',
+                  border: '1px solid var(--line)',
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                  color: 'var(--text)',
+                }}
+              >
+                If Apple Pencil strokes are skipped in My Notes, open iPad Settings → Apple Pencil → Scribble and turn
+                Scribble off. Then reopen My Notes. You can still handwrite and draw with Apple Pencil.
+                Handwriting-to-text in text fields is turned off.
+              </p>
             </article>
 
             <article

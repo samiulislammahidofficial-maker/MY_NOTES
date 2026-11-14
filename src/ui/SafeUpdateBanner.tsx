@@ -71,7 +71,13 @@ export async function checkForServiceWorkerUpdates(options?: {
   }
 
   try {
-    await reg.update();
+    const UPDATE_TIMEOUT_MS = 4500;
+    await Promise.race([
+      reg.update(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Update check timed out')), UPDATE_TIMEOUT_MS),
+      ),
+    ]);
     if (reg.waiting || reg.installing) {
       if (reg.installing && !reg.waiting) {
         await new Promise<void>((resolve) => {
@@ -86,7 +92,7 @@ export async function checkForServiceWorkerUpdates(options?: {
           setTimeout(() => {
             worker.removeEventListener('statechange', onState);
             resolve();
-          }, 4000);
+          }, 1500);
         });
       }
     }

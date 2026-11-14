@@ -6,7 +6,6 @@ import {
   Download,
   HardDrive,
   Info,
-  PenTool,
   RefreshCw,
   ShieldCheck,
   Smartphone,
@@ -16,7 +15,6 @@ import {
   X,
 } from 'lucide-react';
 import { actions, beginEssentialJob, useApp } from '../app/store';
-import type { PenSmoothingLevel } from '../engine/tools';
 import { WritingDiagnosticsModal } from './WritingDiagnosticsModal';
 import {
   LOCAL_PACK_APPROX_LABEL,
@@ -383,9 +381,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             </p>
           </section>
 
-          {/* Section 2: Pen Smoothing & Handwriting Feel */}
+          {/* Section 2: Writing Diagnostics */}
           <section
-            aria-label="Pen Smoothing and Writing Feel"
+            aria-label="Writing Diagnostics"
             style={{
               background: '#141417',
               border: '1px solid var(--line)',
@@ -396,112 +394,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               gap: 10,
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <PenTool size={18} color="#FFE600" />
-                <strong style={{ fontSize: 15 }}>Pen Smoothing & Writing Feel</strong>
-              </div>
-              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-                Active: <strong style={{ color: '#E5E5EA', textTransform: 'capitalize' }}>{s.tool.penSmoothing ?? 'low'}</strong>
-              </span>
-            </div>
-
-            <div className="seg" role="radiogroup" aria-label="Pen smoothing level">
-              {(['off', 'low', 'medium'] as PenSmoothingLevel[]).map((lvl) => {
-                const active = (s.tool.penSmoothing ?? 'low') === lvl;
-                return (
-                  <button
-                    key={lvl}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    className={active ? 'on' : ''}
-                    onClick={() => actions.setTool({ penSmoothing: lvl })}
-                  >
-                    {lvl === 'off' ? 'Off (Raw)' : lvl === 'low' ? 'Low (Default)' : 'Medium'}
-                  </button>
-                );
-              })}
-            </div>
-
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 12,
-                padding: '8px 12px',
-                background: '#1C1C21',
-                borderRadius: 10,
-              }}
-            >
-              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-                {(s.tool.penSmoothing ?? 'low') === 'off'
-                  ? 'Raw stylus samples with zero filter delay—best for ultra-fast sketching.'
-                  : (s.tool.penSmoothing ?? 'low') === 'low'
-                    ? 'Adaptive One-Euro velocity filter removes hand/digitizer micro-jitter while keeping sharp corners.'
-                    : 'Stronger stabilization for slow calligraphy, neat headings, and diagrams.'}
-              </span>
-              <svg width="110" height="32" viewBox="0 0 110 32" aria-hidden="true" style={{ flexShrink: 0 }}>
-                <path
-                  d={
-                    (s.tool.penSmoothing ?? 'low') === 'off'
-                      ? 'M 6 24 Q 20 6, 36 17 T 68 15 T 104 10'
-                      : (s.tool.penSmoothing ?? 'low') === 'low'
-                        ? 'M 6 24 C 26 6, 48 26, 72 14 S 94 8, 104 12'
-                        : 'M 6 22 C 32 8, 56 24, 104 10'
-                  }
-                  fill="none"
-                  stroke={s.tool.color || '#F4F436'}
-                  strokeWidth="2.8"
-                  strokeLinecap="round"
-                />
-              </svg>
-            </div>
-
-            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: 13, fontWeight: 500 }}>Ballpoint Renderer</span>
-                <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-                  Active: <strong style={{ color: '#E5E5EA' }}>{(s.tool.ballpointModel ?? 'normal') === 'compatibility' ? 'Compatibility' : 'Normal'}</strong>
-                </span>
-              </div>
-              <div className="seg" role="radiogroup" aria-label="Ballpoint renderer engine">
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={(s.tool.ballpointModel ?? 'normal') === 'normal'}
-                  className={(s.tool.ballpointModel ?? 'normal') === 'normal' ? 'on' : ''}
-                  onClick={() => actions.setTool({ ballpointModel: 'normal' })}
-                >
-                  Normal (Outlines)
-                </button>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={(s.tool.ballpointModel ?? 'normal') === 'compatibility'}
-                  className={(s.tool.ballpointModel ?? 'normal') === 'compatibility' ? 'on' : ''}
-                  onClick={() => actions.setTool({ ballpointModel: 'compatibility' })}
-                >
-                  Compatibility (Centerline Baseline)
-                </button>
-              </div>
-              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-                {(s.tool.ballpointModel ?? 'normal') === 'compatibility'
-                  ? 'Constant-width Canvas2D centerline path with round caps/joins. Direct, unbroken sample connection with no pressure/outline transforms.'
-                  : 'Dynamic outline mesh with gentle pressure response and physical ink taper.'}
-              </span>
-
-              <div style={{ marginTop: 8 }}>
-                <button
-                  type="button"
-                  className="chip"
-                  onClick={() => setShowDiagnostics(true)}
-                  style={{ gap: 6, color: '#64D2FF', borderColor: 'rgba(100, 210, 255, 0.3)' }}
-                >
-                  <Activity size={14} /> Open Writing Diagnostics Board
-                </button>
-              </div>
+            <div>
+              <button
+                type="button"
+                className="chip"
+                onClick={() => setShowDiagnostics(true)}
+                style={{ gap: 6, color: '#64D2FF', borderColor: 'rgba(100, 210, 255, 0.3)' }}
+              >
+                <Activity size={14} /> Open Writing Diagnostics Board
+              </button>
             </div>
           </section>
 

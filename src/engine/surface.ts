@@ -52,7 +52,8 @@ export interface SurfaceOptions {
   onTextSelect?(tb: TextBox): void;
   onImageSelect?(img: ImageBox | null): void;
   onImageCommit?(prev: ImageBox, next: ImageBox): void;
-  onViewChange?(v: ViewMatrix): void;
+  onViewChange?(v: ViewMatrix, relativeScale: number): void;
+  onPinchZoom?(factor: number, ended: boolean): void;
   onCloseRuler?(): void;
   onStrokeStart?(): void;
   getRuler?(): { x: number; y: number; angle: number };
@@ -315,11 +316,38 @@ export class InkSurface {
   }
   setView(v: ViewMatrix) {
     this.view = this.applyBounds(v);
-    this.opts.onViewChange?.(this.view);
+    this.opts.onViewChange?.(this.view, this.getRelativeScale());
     this.invalidate();
   }
   isStrokeActive() {
     return this.activeId !== null || this.penDown;
+  }
+
+  getFitScale(): number {
+    if (!this.page || this.cssW <= 8) return 1;
+    if (this.opts.fitFullHost) {
+      return this.cssW / Math.max(1, this.page.width);
+    }
+    return this.applyBounds(fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16)).scale;
+  }
+
+  getRelativeScale(): number {
+    const fitS = this.getFitScale();
+    return fitS > 0 ? this.view.scale / fitS : 1;
+  }
+
+  snapToFitWidth() {
+    if (!this.page) return;
+    if (this.opts.fitFullHost) {
+      this.fitWidthView();
+      return;
+    }
+    const fw = this.applyBounds(fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16));
+    const zoomed = zoomAbout(this.view, this.cssW / 2, this.cssH / 2, fw.scale);
+    const next = this.applyBounds({ scale: fw.scale, tx: fw.tx, ty: zoomed.ty });
+    this.view = next;
+    this.opts.onViewChange?.(this.view, 1);
+    this.invalidate();
   }
 
   private applyBounds(v: ViewMatrix): ViewMatrix {
@@ -337,7 +365,7 @@ export class InkSurface {
     } else {
       this.view = this.applyBounds(fitWidth(this.cssW, this.cssH, this.page.width, this.page.height, 20, 16));
     }
-    this.opts.onViewChange?.(this.view);
+    this.opts.onViewChange?.(this.view, 1);
     this.invalidate();
   }
 
@@ -349,15 +377,18 @@ export class InkSurface {
     } else {
       this.view = this.applyBounds(fitPage(this.cssW, this.cssH, this.page.width, this.page.height));
     }
-    this.opts.onViewChange?.(this.view);
+    this.opts.onViewChange?.(this.view, this.getRelativeScale());
     this.invalidate();
   }
 
   zoomByFactor(factor: number) {
+    const fitS = this.getFitScale();
     const targetScale = this.view.scale * factor;
-    this.view = this.applyBounds(zoomAbout(this.view, this.cssW / 2, this.cssH / 2, targetScale));
-    this.opts.onViewChange?.(this.view);
-    this.invalidate();
+    if (fitS > 0 && Math.abs(targetScale / fitS - 1) <= 0.05) {
+      this.snapToFitWidth();
+      return;
+    }
+    this.commitView(zoomAbout(this.view, this.cssW / 2, this.cssH / 2, targetScale));
   }
 
   fit() {
@@ -1547,6 +1578,13 @@ export class InkSurface {
     this.touches.delete(e.pointerId);
     this.debugCounters.up++;
     if (this.touches.size < 2) {
+      if (this.navLast) {
+        if (this.opts.disableCanvasPanWheel && this.opts.onPinchZoom) {
+          this.opts.onPinchZoom(1, true);
+        } else if (Math.abs(this.getRelativeScale() - 1) <= 0.05) {
+          this.snapToFitWidth();
+        }
+      }
       this.navLast = null;
       this.rulerTwoFinger = null;
     }
@@ -1614,6 +1652,13 @@ export class InkSurface {
     this.touches.delete(e.pointerId);
     this.debugCounters.cancel++;
     if (this.touches.size < 2) {
+      if (this.navLast) {
+        if (this.opts.disableCanvasPanWheel && this.opts.onPinchZoom) {
+          this.opts.onPinchZoom(1, true);
+        } else if (Math.abs(this.getRelativeScale() - 1) <= 0.05) {
+          this.snapToFitWidth();
+        }
+      }
       this.navLast = null;
       this.rulerTwoFinger = null;
     }
@@ -1887,15 +1932,21 @@ export class InkSurface {
   private updateNav() {
     const m = this.navMetrics();
     const last = this.navLast!;
+    this.navLast = m;
+    if (this.opts.disableCanvasPanWheel && this.opts.onPinchZoom) {
+      if (last.d > 4) {
+        this.opts.onPinchZoom(m.d / last.d, false);
+      }
+      return;
+    }
     let v: ViewMatrix = { ...this.view, tx: this.view.tx + (m.cx - last.cx), ty: this.view.ty + (m.cy - last.cy) };
     if (last.d > 4) v = zoomAbout(v, m.cx, m.cy, v.scale * (m.d / last.d));
-    this.navLast = m;
     this.commitView(v);
   }
   /** Single entry point for gesture-driven view changes: validate bounds, notify, repaint. */
   private commitView(v: ViewMatrix) {
     this.view = this.applyBounds(v);
-    this.opts.onViewChange?.(this.view);
+    this.opts.onViewChange?.(this.view, this.getRelativeScale());
     this.invalidate();
   }
   private onWheel = (e: WheelEvent) => {

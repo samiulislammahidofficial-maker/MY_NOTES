@@ -59,7 +59,12 @@ button:disabled { opacity: .35; cursor: default; }
 
 /* editor */
 .editor {
+  position: fixed;
+  inset: 0;
+  width: 100%;
   height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -218,8 +223,36 @@ button:disabled { opacity: .35; cursor: default; }
   white-space: nowrap;
 }
 .debug { position: absolute; top: 8px; right: 8px; background: #000a; color: #9f9; font-size: 11px; padding: 6px; max-width: 60%; white-space: pre-wrap; margin: 0; }
-.pen-pop { position: absolute; left: 64px; top: 12px; width: 280px; }
-.more-menu { position: absolute; right: 8px; top: 58px; width: 260px; }
+.pen-pop {
+  position: absolute;
+  left: 64px;
+  top: 12px;
+  width: min(280px, calc(100vw - 80px));
+  max-height: calc(100dvh - 80px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  z-index: 40;
+}
+.more-menu {
+  position: fixed;
+  right: calc(8px + env(safe-area-inset-right));
+  top: calc(58px + env(safe-area-inset-top));
+  width: min(304px, calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right)));
+  max-height: calc(100dvh - 70px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  z-index: 40;
+}
+.popover-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 32;
+  background: transparent;
+  touch-action: none;
+}
 .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; flex-wrap: wrap; }
 .swatches { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 10px; align-items: center; }
 .sw { width: 34px !important; height: 34px; min-height: 34px !important; border-radius: 50%; padding: 0 !important; border: 1px solid #fff4; }
@@ -339,6 +372,9 @@ button:disabled { opacity: .35; cursor: default; }
   left: 66px;
   bottom: 18px;
   width: min(352px, calc(100vw - 80px));
+  max-height: calc(100dvh - 84px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: #202022;
   border: 1px solid #323236;
   border-radius: 22px;
@@ -1267,8 +1303,8 @@ button:disabled { opacity: .35; cursor: default; }
 /* Bottom-left compact readout (e.g. "20% | 45 of 73") */
 .hud-left-readout {
   position: absolute;
-  left: 14px;
-  bottom: 14px;
+  left: 12px;
+  bottom: 52px;
   z-index: 14;
   display: inline-flex;
   align-items: center;
@@ -1345,7 +1381,8 @@ button:disabled { opacity: .35; cursor: default; }
   top: 56px;
   bottom: 16px;
   width: min(320px, calc(100vw - 76px));
-  z-index: 35;
+  z-index: 40;
+  overscroll-behavior: contain;
   background: rgba(28, 28, 32, 0.96);
   backdrop-filter: blur(18px);
   border: 1px solid var(--line);
@@ -1380,6 +1417,8 @@ button:disabled { opacity: .35; cursor: default; }
   background: rgba(255, 255, 255, 0.04);
 }
 .switch-pill {
+  appearance: none;
+  -webkit-appearance: none;
   width: 42px;
   height: 24px;
   border-radius: 999px;
@@ -1390,7 +1429,8 @@ button:disabled { opacity: .35; cursor: default; }
   transition: background 0.15s ease;
   flex-shrink: 0;
 }
-.switch-pill.on {
+.switch-pill.on,
+.switch-pill:checked {
   background: #30d158;
 }
 .switch-pill::after {
@@ -1404,6 +1444,61 @@ button:disabled { opacity: .35; cursor: default; }
   background: #ffffff;
   transition: transform 0.15s ease;
 }
-.switch-pill.on::after {
+.switch-pill.on::after,
+.switch-pill:checked::after {
   transform: translateX(18px);
+}
+
+/* Dedicated print-only document container */
+.print-only-container {
+  display: none;
+}
+
+@media print {
+  @page {
+    margin: 0;
+  }
+  html,
+  body,
+  #root {
+    position: static !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+  .editor {
+    position: static !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+  }
+  .editor > :not(.print-only-container) {
+    display: none !important;
+  }
+  .print-only-container {
+    display: block !important;
+    background: #ffffff;
+  }
+  .print-page {
+    page-break-after: always;
+    break-after: page;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+  }
+  .print-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .print-page img {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+  }
 }

@@ -42,6 +42,7 @@ import {
   MoreHorizontal,
   Pen,
   Plus,
+  Printer,
   Redo2,
   Ruler,
   Scissors,
@@ -376,6 +377,7 @@ function ContinuousPageCard({
   onAnyStrokeStart,
   selectedImageId,
   onSelectImage,
+  onPinchZoom,
 }: {
   paneIndex: number;
   page: Page;
@@ -390,6 +392,7 @@ function ContinuousPageCard({
   onAnyStrokeStart: () => void;
   selectedImageId: string | null;
   onSelectImage: (id: string | null) => void;
+  onPinchZoom?: (factor: number, ended: boolean) => void;
 }) {
   const version = useApp((s) => s.strokeVersion);
   const paper = useApp((s) => s.paper);
@@ -459,6 +462,7 @@ function ContinuousPageCard({
       },
       fitFullHost: true,
       disableCanvasPanWheel: true,
+      onPinchZoom,
     });
     surfRef.current = surface;
     surface.setPage(page, getStrokes(page.id));
@@ -608,6 +612,8 @@ function Pane({
   const isPenDownRef = useRef(false);
   const [scrollThumb, setScrollThumb] = useState({ topPct: 0, heightPct: 100, visible: false, hasOverflow: false });
   const scrollFadeTimerRef = useRef<number>(0);
+  const programmaticScrollUntilRef = useRef(0);
+  const addingPageRef = useRef(false);
 
   // Sync zoomScale to continuousScale when in continuous mode
   useEffect(() => {
@@ -640,11 +646,13 @@ function Pane({
         ? (wrap.scrollTop + wrap.clientHeight / 2) / wrap.scrollHeight
         : 0;
       setContinuousScale((prev) => {
-        const next = Math.max(0.2, Math.min(3.0, prev * factor));
+        let next = Math.max(0.2, Math.min(3.0, prev * factor));
+        if (Math.abs(next - 1) <= 0.05) next = 1;
         setZoomScale(next);
         if (wrap) {
           requestAnimationFrame(() => {
             wrap.scrollTop = Math.max(0, centerRatio * wrap.scrollHeight - wrap.clientHeight / 2);
+            if (next <= 1) wrap.scrollLeft = 0;
             updateScrollThumb(wrap);
           });
         }
@@ -653,6 +661,28 @@ function Pane({
     } else {
       surf.current?.zoomByFactor(factor);
     }
+  };
+
+  const handleContinuousPinch = (factor: number, ended: boolean) => {
+    const wrap = scrollWrapRef.current;
+    const centerRatio = wrap && wrap.scrollHeight > 0
+      ? (wrap.scrollTop + wrap.clientHeight / 2) / wrap.scrollHeight
+      : 0;
+    setContinuousScale((prev) => {
+      let next = ended ? prev : Math.max(0.2, Math.min(3.0, prev * factor));
+      if (ended && Math.abs(next - 1) <= 0.05) {
+        next = 1;
+      }
+      setZoomScale(next);
+      if (wrap) {
+        requestAnimationFrame(() => {
+          wrap.scrollTop = Math.max(0, centerRatio * wrap.scrollHeight - wrap.clientHeight / 2);
+          if (next <= 1) wrap.scrollLeft = 0;
+          updateScrollThumb(wrap);
+        });
+      }
+      return next;
+    });
   };
 
   const resetFit = () => {
@@ -666,11 +696,12 @@ function Pane({
       if (wrap) {
         requestAnimationFrame(() => {
           wrap.scrollTop = Math.max(0, centerRatio * wrap.scrollHeight - wrap.clientHeight / 2);
+          wrap.scrollLeft = 0;
           updateScrollThumb(wrap);
         });
       }
     } else {
-      surf.current?.fit();
+      surf.current?.snapToFitWidth();
     }
     setZoomMenuOpen(false);
   };
@@ -701,7 +732,7 @@ function Pane({
       onActivate: () => actions.setActivePane(index),
       onSelection: setSel,
       onCopy: (list) => actions.copy(list),
-      onViewChange: (v) => setZoomScale(v.scale),
+      onViewChange: (_v, relScale) => setZoomScale(relScale),
       onCanvasTap: (pt) => {
         const pid = pageOf();
         if (pid) setTapBox({ pageId: pid, x: pt.x, y: pt.y, text: '' });
@@ -858,22 +889,36 @@ function Pane({
   };
 
   const scrollToAndActivatePage = (pageId: string) => {
+    programmaticScrollUntilRef.current = performance.now() + 700;
     actions.setPage(index, pageId);
     if (pageViewMode === 'continuous' && scrollWrapRef.current) {
       requestAnimationFrame(() => {
-        const el = scrollWrapRef.current?.querySelector(`[data-page-id="${pageId}"]`) as HTMLElement | null;
-        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        requestAnimationFrame(() => {
+          const el = scrollWrapRef.current?.querySelector(`[data-page-id="${pageId}"]`) as HTMLElement | null;
+          el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
       });
     }
   };
 
   const handleAddPageAfterAndScroll = async (afterPageId?: string) => {
-    const newId = await actions.addPageAfter(index, afterPageId);
-    if (newId && pageViewMode === 'continuous') {
-      requestAnimationFrame(() => {
-        const el = scrollWrapRef.current?.querySelector(`[data-page-id="${newId}"]`) as HTMLElement | null;
-        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
+    if (addingPageRef.current) return;
+    addingPageRef.current = true;
+    try {
+      programmaticScrollUntilRef.current = performance.now() + 850;
+      const newId = await actions.addPageAfter(index, afterPageId);
+      if (newId && pageViewMode === 'continuous') {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            const wrap = scrollWrapRef.current;
+            const el = wrap?.querySelector(`[data-page-id="${newId}"]`) as HTMLElement | null;
+            el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            if (wrap) updateScrollThumb(wrap);
+          });
+        });
+      }
+    } finally {
+      addingPageRef.current = false;
     }
   };
 
@@ -972,6 +1017,7 @@ function Pane({
           onScroll={(e) => {
             const wrap = e.currentTarget;
             updateScrollThumb(wrap);
+            if (performance.now() < programmaticScrollUntilRef.current) return;
             const centerY = wrap.scrollTop + wrap.clientHeight * 0.5;
             const cards = wrap.querySelectorAll<HTMLElement>('.continuous-page-card');
             let bestId: string | undefined;
@@ -998,7 +1044,7 @@ function Pane({
           <div
             className="continuous-pages-stack"
             style={{
-              maxWidth: `min(100%, ${Math.round(1400 * continuousScale)}px)`,
+              maxWidth: `${Math.round(1400 * continuousScale)}px`,
               width: `${Math.round(100 * continuousScale)}%`,
             }}
           >
@@ -1029,6 +1075,7 @@ function Pane({
                     }}
                     selectedImageId={selectedImageId}
                     onSelectImage={onSelectImage}
+                    onPinchZoom={handleContinuousPinch}
                   />
                   {pageIdx < pages.length - 1 && (
                     <div className="page-boundary-bar" role="group" aria-label={`After page ${pageIdx + 1}`}>
@@ -1123,10 +1170,10 @@ function Pane({
               <button
                 type="button"
                 className="bottom-explicit-add-btn"
-                aria-label="Add page at end of notebook"
+                aria-label="Add Page"
                 onClick={() => void handleAddPageAfterAndScroll(pages[pages.length - 1]?.id)}
               >
-                <Plus size={16} /> <span>Add page</span>
+                <Plus size={16} /> <span>Add Page</span>
               </button>
             </div>
           </div>
@@ -1226,8 +1273,25 @@ function Pane({
         </div>
       )}
 
+      {zoomMenuOpen && (
+        <div
+          className="popover-scrim"
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setZoomMenuOpen(false);
+          }}
+        />
+      )}
+
       {/* Compact unified Tablet Bottom HUD (Non-overlapping & Responsive) */}
-      <div className="hud-bottom-bar" role="toolbar" aria-label="Page navigation and document view">
+      <div
+        className="hud-bottom-bar"
+        role="toolbar"
+        aria-label="Page navigation and document view"
+        style={{ zIndex: zoomMenuOpen ? 38 : undefined }}
+      >
         <div className="hud-pager-group">
           <button
             className="icon xs hud-btn"
@@ -1550,10 +1614,16 @@ export function Editor() {
 
   const editorRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const moreBtnRef = useRef<HTMLButtonElement>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [toolbarItems, setToolbarItems] = useState<ToolbarItemConfig[]>(() => loadToolbarConfig());
   const [showCustomizeToolbar, setShowCustomizeToolbar] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [shareFormat, setShareFormat] = useState<'pdf' | 'jpg'>('pdf');
+  const [sharePageScope, setSharePageScope] = useState<'current' | 'all' | 'range'>('all');
+  const [shareRangeInput, setShareRangeInput] = useState('1');
+  const [printPageUrls, setPrintPageUrls] = useState<string[]>([]);
   const [showFindModal, setShowFindModal] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [showPageJumpModal, setShowPageJumpModal] = useState(false);
@@ -1829,9 +1899,44 @@ export function Editor() {
 
   const T = s.tool;
 
-  const handleExportPdf = async () => {
+  const resolveSharePages = (): Page[] => {
+    if (!curPages.length) return [];
+    if (sharePageScope === 'current') {
+      return curPage ? [curPage] : [curPages[0]];
+    }
+    if (sharePageScope === 'range') {
+      // Parse asynchronously loaded or sync helper; we keep simple inline parse here and also use parsePageRange in pdfManager
+      const indices: number[] = [];
+      const seen = new Set<number>();
+      for (const part of shareRangeInput.split(',')) {
+        const seg = part.trim();
+        if (!seg) continue;
+        const m = /^(\d+)\s*-\s*(\d+)$/.exec(seg);
+        if (m) {
+          const a = Math.max(1, Math.min(curPages.length, Number.parseInt(m[1], 10)));
+          const b = Math.max(1, Math.min(curPages.length, Number.parseInt(m[2], 10)));
+          for (let k = Math.min(a, b); k <= Math.max(a, b); k++) {
+            if (!seen.has(k - 1)) { seen.add(k - 1); indices.push(k - 1); }
+          }
+        } else if (/^\d+$/.test(seg)) {
+          const n = Number.parseInt(seg, 10);
+          if (n >= 1 && n <= curPages.length && !seen.has(n - 1)) { seen.add(n - 1); indices.push(n - 1); }
+        }
+      }
+      indices.sort((a, b) => a - b);
+      return indices.length ? indices.map((i) => curPages[i]) : (curPage ? [curPage] : []);
+    }
+    return curPages;
+  };
+
+  const handleShareExportPdf = async () => {
     if (!curNb) return;
-    setPop(null);
+    const targetPages = resolveSharePages();
+    if (!targetPages.length) {
+      alert('Please select at least one valid page.');
+      return;
+    }
+    setShowShareModal(false);
     setBusyMsg('Exporting vector PDF…');
     const endJob = beginEssentialJob('pdf-export');
     try {
@@ -1841,13 +1946,14 @@ export function Editor() {
       ]);
       const bytes = await exportNotebookToPdfBytes(
         curNb,
-        curPages,
+        targetPages,
         (pid) => getStrokes(pid),
         (pid) => getTexts(pid),
         (pid) => getLayers(pid),
         (pid) => getImages(pid),
       );
-      await saveOrShareFileBytes(bytes, `${curNb.title || 'Notebook'}.pdf`, 'application/pdf');
+      const suffix = targetPages.length === 1 && curPageIdx >= 0 ? `-page-${curPageIdx + 1}` : '';
+      await saveOrShareFileBytes(bytes, `${curNb.title || 'Notebook'}${suffix}.pdf`, 'application/pdf');
     } catch (err) {
       alert(`PDF export failed: ${(err as Error).message}`);
     } finally {
@@ -1855,6 +1961,129 @@ export function Editor() {
       setBusyMsg(null);
     }
   };
+
+  const handleShareExportJpg = async () => {
+    if (!curNb || !curPage) return;
+    setShowShareModal(false);
+    setBusyMsg('Rendering JPG image…');
+    const endJob = beginEssentialJob('jpg-export');
+    try {
+      const [{ exportPageToJpgBytes }, { saveOrShareFileBytes }] = await Promise.all([
+        loadPdfManager(),
+        loadBackupManager(),
+      ]);
+      const bytes = await exportPageToJpgBytes(
+        curNb,
+        curPage,
+        getStrokes(curPage.id),
+        getTexts(curPage.id),
+        getLayers(curPage.id),
+        getImages(curPage.id),
+        2,
+      );
+      await saveOrShareFileBytes(
+        bytes,
+        `${curNb.title || 'Notebook'}-page-${curPageIdx + 1}.jpg`,
+        'image/jpeg',
+      );
+    } catch (err) {
+      alert(`JPG export failed: ${(err as Error).message}`);
+    } finally {
+      endJob();
+      setBusyMsg(null);
+    }
+  };
+
+  const handlePrintPages = async () => {
+    if (!curNb) return;
+    const targetPages = shareFormat === 'jpg' && curPage ? [curPage] : resolveSharePages();
+    if (!targetPages.length) {
+      alert('No pages selected to print.');
+      return;
+    }
+    setShowShareModal(false);
+    setBusyMsg('Preparing pages for print…');
+    const endJob = beginEssentialJob('print-prepare');
+    try {
+      const { renderPageToCanvas } = await loadPdfManager();
+      const urls: string[] = [];
+      for (const pg of targetPages) {
+        const canvas = await renderPageToCanvas(
+          curNb,
+          pg,
+          getStrokes(pg.id),
+          getTexts(pg.id),
+          getLayers(pg.id),
+          getImages(pg.id),
+          2,
+        );
+        urls.push(canvas.toDataURL('image/png'));
+      }
+      setPrintPageUrls(urls);
+      // Wait for React commit and image decoding before opening print preview
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      const printImgs = Array.from(document.querySelectorAll<HTMLImageElement>('.print-only-container img'));
+      await Promise.all(
+        printImgs.map((img) =>
+          img.complete
+            ? img.decode?.().catch(() => undefined)
+            : new Promise<void>((res) => {
+                img.onload = () => res();
+                img.onerror = () => res();
+              }),
+        ),
+      );
+      setBusyMsg(null);
+      window.print();
+    } catch (err) {
+      alert(`Print preparation failed: ${(err as Error).message}`);
+    } finally {
+      endJob();
+      setBusyMsg(null);
+    }
+  };
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (pop !== null || showCustomizeToolbar) {
+        const restoreMore = pop === 'more' || showCustomizeToolbar;
+        setPop(null);
+        setShowCustomizeToolbar(false);
+        if (restoreMore) {
+          requestAnimationFrame(() => moreBtnRef.current?.focus());
+        }
+      } else if (showShareModal) {
+        setShowShareModal(false);
+      } else if (showFindModal) {
+        setShowFindModal(false);
+      } else if (showPageJumpModal) {
+        setShowPageJumpModal(false);
+      } else if (showResizeModal) {
+        setShowResizeModal(false);
+      } else if (showPaperModal) {
+        setShowPaperModal(false);
+      } else if (showGestureSettings) {
+        setShowGestureSettings(false);
+      } else if (showDocEditing) {
+        setShowDocEditing(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    pop,
+    showCustomizeToolbar,
+    showShareModal,
+    showFindModal,
+    showPageJumpModal,
+    showResizeModal,
+    showPaperModal,
+    showGestureSettings,
+    showDocEditing,
+  ]);
 
   const handleExportNotebookZip = async () => {
     if (!curNb) return;
@@ -1937,13 +2166,32 @@ export function Editor() {
         >
           <Columns2 size={22} />
         </button>
-        <button className="icon blue" aria-label="More" onClick={() => setPop(pop === 'more' ? null : 'more')}>
+        <button
+          ref={moreBtnRef}
+          className="icon blue"
+          aria-label="More"
+          aria-expanded={pop === 'more'}
+          onClick={() => setPop(pop === 'more' ? null : 'more')}
+        >
           <MoreHorizontal size={22} />
         </button>
       </header>
 
+      {(pop !== null || showCustomizeToolbar) && (
+        <div
+          className="popover-scrim"
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setPop(null);
+            setShowCustomizeToolbar(false);
+          }}
+        />
+      )}
+
       {pop === 'more' && (
-        <div className="popover more-menu" role="menu" style={{ minWidth: 296 }}>
+        <div className="popover more-menu" role="menu">
           <div style={{ textAlign: 'center', fontWeight: 600, fontSize: 15, padding: '4px 0 8px' }}>
             More
           </div>
@@ -1964,7 +2212,10 @@ export function Editor() {
               className="more-shortcut"
               onClick={() => {
                 setPop(null);
-                window.print();
+                setShareFormat('pdf');
+                setSharePageScope('all');
+                setShareRangeInput(`1-${Math.max(1, curPages.length)}`);
+                setShowShareModal(true);
               }}
             >
               <Share size={18} />
@@ -2165,42 +2416,13 @@ export function Editor() {
             </button>
           </div>
 
-          <div className="row">Paper colour</div>
-          <div className="swatches">
-            {PAPER_COLORS.map((c) => (
-              <button
-                key={c}
-                className={`sw ${s.paper.toLowerCase() === c.toLowerCase() ? 'sel' : ''}`}
-                style={{ background: c }}
-                aria-label={`Paper ${c}`}
-                aria-pressed={s.paper.toLowerCase() === c.toLowerCase()}
-                onClick={() => actions.setPaper(c)}
-              />
-            ))}
-          </div>
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={T.scribbleErase}
-              onChange={(e) => actions.setTool({ scribbleErase: e.target.checked })}
-            />{' '}
-            Scribble to erase
-          </label>
-          <label className="row">
-            <input
-              type="checkbox"
-              checked={T.shapeSnap}
-              onChange={(e) => actions.setTool({ shapeSnap: e.target.checked })}
-            />{' '}
-            Draw & hold shape snap
-          </label>
-          <label className="row">
+          <label className="nav-row" style={{ justifyContent: 'space-between', cursor: 'pointer' }}>
+            <span>Performance panel</span>
             <input
               type="checkbox"
               checked={s.debug}
               onChange={(e) => useApp.setState({ debug: e.target.checked })}
-            />{' '}
-            Performance panel
+            />
           </label>
 
           <hr style={{ border: 0, borderTop: '1px solid var(--line)', margin: '6px 0' }} />
@@ -2355,8 +2577,14 @@ export function Editor() {
           >
             <ImageIcon size={16} /> <span>Insert Image</span>
           </button>
-          <button role="menuitem" className="nav-row" onClick={() => void handleExportPdf()}>
-            <FileDown size={16} /> <span>Export as PDF</span>
+          <button role="menuitem" className="nav-row" onClick={() => {
+            setPop(null);
+            setShareFormat('pdf');
+            setSharePageScope('all');
+            setShareRangeInput(`1-${Math.max(1, curPages.length)}`);
+            setShowShareModal(true);
+          }}>
+            <FileDown size={16} /> <span>Share / Print (PDF &amp; JPG)</span>
           </button>
           <button role="menuitem" className="nav-row" onClick={() => void handleExportNotebookZip()}>
             <Download size={16} /> <span>Export Backup (.tabletnotes.zip)</span>
@@ -2878,13 +3106,123 @@ export function Editor() {
         </div>
       )}
 
+      {showShareModal && curNb && (
+        <div className="modal-scrim" onClick={() => setShowShareModal(false)}>
+          <div className="nn-dialog" style={{ width: 'min(420px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Share &amp; Print</h2>
+              <button
+                type="button"
+                className="nn-close"
+                aria-label="Close Share"
+                onClick={() => setShowShareModal(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="seg tabs2" role="tablist" aria-label="Export format" style={{ marginBottom: 14 }}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={shareFormat === 'pdf'}
+                className={shareFormat === 'pdf' ? 'on' : ''}
+                onClick={() => setShareFormat('pdf')}
+              >
+                PDF
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={shareFormat === 'jpg'}
+                className={shareFormat === 'jpg' ? 'on' : ''}
+                onClick={() => setShareFormat('jpg')}
+              >
+                JPG
+              </button>
+            </div>
+
+            {shareFormat === 'pdf' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ fontSize: 13, color: 'var(--muted)' }}>Pages to include ({curPages.length} total):</div>
+                <label className="row" style={{ justifyContent: 'flex-start', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="share-scope"
+                    checked={sharePageScope === 'current'}
+                    onChange={() => setSharePageScope('current')}
+                  />
+                  <span>Current page (Page {curPageIdx + 1})</span>
+                </label>
+                <label className="row" style={{ justifyContent: 'flex-start', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="share-scope"
+                    checked={sharePageScope === 'all'}
+                    onChange={() => setSharePageScope('all')}
+                  />
+                  <span>All pages (1 – {curPages.length})</span>
+                </label>
+                <label className="row" style={{ justifyContent: 'flex-start', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="share-scope"
+                    checked={sharePageScope === 'range'}
+                    onChange={() => setSharePageScope('range')}
+                  />
+                  <span>Page range</span>
+                  {sharePageScope === 'range' && (
+                    <input
+                      type="text"
+                      className="nn-input"
+                      aria-label="Page range"
+                      placeholder={`e.g. 1-${curPages.length}`}
+                      value={shareRangeInput}
+                      onChange={(e) => setShareRangeInput(e.target.value)}
+                      style={{ flex: 1, minHeight: 34, marginLeft: 8 }}
+                    />
+                  )}
+                </label>
+                <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+                  <button type="button" className="chip" onClick={() => void handlePrintPages()} style={{ gap: 6 }}>
+                    <Printer size={15} /> <span>Print</span>
+                  </button>
+                  <button type="button" className="nn-create" onClick={() => void handleShareExportPdf()}>
+                    <Share size={15} /> <span>Share / Save PDF</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <p style={{ margin: 0, fontSize: 13, color: 'var(--muted)', lineHeight: 1.5 }}>
+                  Exports the current page (Page {curPageIdx + 1}) as a high-resolution JPG image
+                  {curPage ? ` (${Math.round(curPage.width * 2)} × ${Math.round(curPage.height * 2)} px)` : ''},
+                  preserving aspect ratio independently of zoom and scroll.
+                </p>
+                <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
+                  <button type="button" className="nn-create" onClick={() => void handleShareExportJpg()}>
+                    <Share size={15} /> <span>Share / Save JPG</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {showFindModal && (
-        <div className="modal-back" onClick={() => setShowFindModal(false)}>
-          <div className="modal" style={{ maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 10px' }}>Find in Notebook</h3>
+        <div className="modal-scrim" onClick={() => setShowFindModal(false)}>
+          <div className="nn-dialog" style={{ width: 'min(380px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Find in Notebook</h2>
+              <button type="button" className="nn-close" aria-label="Close Find" onClick={() => setShowFindModal(false)}>
+                <X size={16} />
+              </button>
+            </div>
             <input
               type="text"
-              className="input"
+              className="nn-input"
+              style={{ width: '100%' }}
               placeholder="Search text items..."
               value={findQuery}
               onChange={(e) => setFindQuery(e.target.value)}
@@ -2916,7 +3254,7 @@ export function Editor() {
                 : null}
             </div>
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
-              <button type="button" className="btn" onClick={() => setShowFindModal(false)}>
+              <button type="button" className="chip" onClick={() => setShowFindModal(false)}>
                 Close
               </button>
             </div>
@@ -2925,12 +3263,18 @@ export function Editor() {
       )}
 
       {showPageJumpModal && (
-        <div className="modal-back" onClick={() => setShowPageJumpModal(false)}>
-          <div className="modal" style={{ maxWidth: 320 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 10px' }}>Go to Page (1 - {curPages.length})</h3>
+        <div className="modal-scrim" onClick={() => setShowPageJumpModal(false)}>
+          <div className="nn-dialog" style={{ width: 'min(320px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Go to Page (1 - {curPages.length})</h2>
+              <button type="button" className="nn-close" aria-label="Close Page Jump" onClick={() => setShowPageJumpModal(false)}>
+                <X size={16} />
+              </button>
+            </div>
             <input
               type="number"
-              className="input"
+              className="nn-input"
+              style={{ width: '100%' }}
               min={1}
               max={curPages.length}
               value={jumpPageNum}
@@ -2938,12 +3282,12 @@ export function Editor() {
               autoFocus
             />
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12, gap: 8 }}>
-              <button type="button" className="btn" onClick={() => setShowPageJumpModal(false)}>
+              <button type="button" className="chip" onClick={() => setShowPageJumpModal(false)}>
                 Cancel
               </button>
               <button
                 type="button"
-                className="btn primary"
+                className="nn-create"
                 onClick={() => {
                   const n = Number.parseInt(jumpPageNum, 10);
                   if (Number.isFinite(n) && n >= 1 && n <= curPages.length) {
@@ -2960,14 +3304,19 @@ export function Editor() {
       )}
 
       {showResizeModal && curPage && (
-        <div className="modal-back" onClick={() => setShowResizeModal(false)}>
-          <div className="modal" style={{ maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 8px' }}>Expand &amp; Resize Page</h3>
-            <p style={{ fontSize: 12, color: 'var(--muted)', margin: '0 0 12px' }}>
+        <div className="modal-scrim" onClick={() => setShowResizeModal(false)}>
+          <div className="nn-dialog" style={{ width: 'min(380px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Expand &amp; Resize Page</h2>
+              <button type="button" className="nn-close" aria-label="Close Resize" onClick={() => setShowResizeModal(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <p style={{ fontSize: 13, color: 'var(--muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
               Current page size: {curPage.width} × {curPage.height} px. Expanding preserves all existing ink and items in place; shrinking below existing strokes may clip content outside the new bounds.
             </p>
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
-              <button type="button" className="btn" onClick={() => setShowResizeModal(false)}>
+              <button type="button" className="chip" onClick={() => setShowResizeModal(false)}>
                 Close
               </button>
             </div>
@@ -2975,18 +3324,24 @@ export function Editor() {
         </div>
       )}
 
-      {showPaperModal && curPage && (
-        <div className="modal-back" onClick={() => setShowPaperModal(false)}>
-          <div className="modal" style={{ maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 10px' }}>Paper Template</h3>
-            <div style={{ display: 'grid', gap: 6 }}>
-              {(['blank', 'ruled', 'grid', 'dotted', 'cornell'] as const).map((tpl) => (
+      {showPaperModal && curPage && curNb && (
+        <div className="modal-scrim" onClick={() => setShowPaperModal(false)}>
+          <div className="nn-dialog" style={{ width: 'min(360px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Paper Template &amp; Color</h2>
+              <button type="button" className="nn-close" aria-label="Close Paper" onClick={() => setShowPaperModal(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>Template</div>
+            <div style={{ display: 'grid', gap: 6, marginBottom: 14 }}>
+              {(['blank', 'ruled', 'grid', 'dotted'] as const).map((tpl) => (
                 <button
                   key={tpl}
                   type="button"
-                  className="nav-row"
+                  className={`nav-row ${curNb.template === tpl ? 'active' : ''}`}
                   onClick={() => {
-                    actions.setPaper(tpl);
+                    void actions.patchNotebook(curNb.id, { template: tpl });
                     setShowPaperModal(false);
                   }}
                 >
@@ -2994,8 +3349,21 @@ export function Editor() {
                 </button>
               ))}
             </div>
+            <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>Paper Colour</div>
+            <div className="swatches" style={{ padding: '4px 0' }}>
+              {PAPER_COLORS.map((c) => (
+                <button
+                  key={c}
+                  className={`sw ${s.paper.toLowerCase() === c.toLowerCase() ? 'sel' : ''}`}
+                  style={{ background: c }}
+                  aria-label={`Paper ${c}`}
+                  aria-pressed={s.paper.toLowerCase() === c.toLowerCase()}
+                  onClick={() => actions.setPaper(c)}
+                />
+              ))}
+            </div>
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
-              <button type="button" className="btn" onClick={() => setShowPaperModal(false)}>
+              <button type="button" className="chip" onClick={() => setShowPaperModal(false)}>
                 Close
               </button>
             </div>
@@ -3004,10 +3372,15 @@ export function Editor() {
       )}
 
       {showGestureSettings && (
-        <div className="modal-back" onClick={() => setShowGestureSettings(false)}>
-          <div className="modal" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 10px' }}>Gesture Settings</h3>
-            <label className="row" style={{ justifyContent: 'space-between' }}>
+        <div className="modal-scrim" onClick={() => setShowGestureSettings(false)}>
+          <div className="nn-dialog" style={{ width: 'min(360px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Gesture Settings</h2>
+              <button type="button" className="nn-close" aria-label="Close Gesture Settings" onClick={() => setShowGestureSettings(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <label className="row" style={{ justifyContent: 'space-between', cursor: 'pointer' }}>
               <span>Draw with Touch</span>
               <input
                 type="checkbox"
@@ -3017,7 +3390,7 @@ export function Editor() {
               />
             </label>
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
-              <button type="button" className="btn" onClick={() => setShowGestureSettings(false)}>
+              <button type="button" className="chip" onClick={() => setShowGestureSettings(false)}>
                 Done
               </button>
             </div>
@@ -3026,10 +3399,15 @@ export function Editor() {
       )}
 
       {showDocEditing && (
-        <div className="modal-back" onClick={() => setShowDocEditing(false)}>
-          <div className="modal" style={{ maxWidth: 360 }} onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ margin: '0 0 10px' }}>Document Editing</h3>
-            <label className="row">
+        <div className="modal-scrim" onClick={() => setShowDocEditing(false)}>
+          <div className="nn-dialog" style={{ width: 'min(360px, 100%)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="nn-head">
+              <h2>Document Editing</h2>
+              <button type="button" className="nn-close" aria-label="Close Document Editing" onClick={() => setShowDocEditing(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <label className="row" style={{ justifyContent: 'flex-start', cursor: 'pointer' }}>
               <input
                 type="checkbox"
                 checked={T.scribbleErase}
@@ -3037,7 +3415,7 @@ export function Editor() {
               />{' '}
               Scribble to erase
             </label>
-            <label className="row">
+            <label className="row" style={{ justifyContent: 'flex-start', cursor: 'pointer' }}>
               <input
                 type="checkbox"
                 checked={T.shapeSnap}
@@ -3046,13 +3424,21 @@ export function Editor() {
               Draw &amp; hold shape snap
             </label>
             <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
-              <button type="button" className="btn" onClick={() => setShowDocEditing(false)}>
+              <button type="button" className="chip" onClick={() => setShowDocEditing(false)}>
                 Done
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <div className="print-only-container" aria-hidden="true">
+        {printPageUrls.map((url, idx) => (
+          <div key={idx} className="print-page">
+            <img src={url} alt={`Notebook page ${idx + 1}`} />
+          </div>
+        ))}
+      </div>
 
       {copiedLinkMsg && (
         <div
