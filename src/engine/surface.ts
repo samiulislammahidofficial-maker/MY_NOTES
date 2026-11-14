@@ -1,8 +1,10 @@
-import type { ImageBox, InkStroke, Page, Template, TextBox, ViewMatrix } from '../domain/types';
-import { SAMPLE_STRIDE, isDark } from '../domain/types';
+import type { ImageBox, ImageCrop, InkStroke, Page, RectBounds, Template, TextBox, ViewMatrix } from '../domain/types';
+import { SAMPLE_STRIDE, getCropBoxBounds, getFullImageBounds, isDark, normalizeImageCrop } from '../domain/types';
 import { clientToDoc, constrainView, fitPage, fitWidth, zoomAbout } from '../domain/geometry';
-import { SampleBuffer, StrokeStabilizer, arbitrate, expandEvents, resolvePressure } from './input';
-import { applyView, boundsOf, centerlinePath, createRainbowStyle, strokePath } from './render';
+import { SampleBuffer, StrokeStabilizer, arbitrate, expandEvents, normalizeCoalescedTimestamps, resolvePressure } from './input';
+import { applyView, boundsOf, centerlinePath, cleanStrokeSamples, createRainbowStyle, strokePath } from './render';
+
+export { getCropBoxBounds, getFullImageBounds };
 import {
   type Pt,
   bboxIntersectsPolygonBounds,
@@ -48,6 +50,10 @@ export interface SurfaceOptions {
   getSelectedTextId?(): string | null;
   getImages?(): ImageBox[];
   getSelectedImageId?(): string | null;
+  isImageEditMode?(): boolean;
+  getCroppingImageId?(): string | null;
+  getDraftCrop?(): ImageCrop | null;
+  onDraftCropChange?(crop: ImageCrop): void;
   onCanvasTap?(docPt: { x: number; y: number }): void;
   onTextSelect?(tb: TextBox): void;
   onImageSelect?(img: ImageBox | null): void;
@@ -151,10 +157,28 @@ export class InkSurface {
   private bgCanvas: HTMLCanvasElement | HTMLImageElement | null = null;
   private bgPageKey = '';
   private imageElements = new Map<string, HTMLImageElement>();
+  private lastStrokeTMs: number | null = null;
+  private panTap: { startX: number; startY: number; startTime: number; docPt: Pt; moved: boolean } | null = null;
   private imageDrag: {
-    kind: 'move' | 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br';
+    kind:
+      | 'move'
+      | 'resize-tl'
+      | 'resize-tr'
+      | 'resize-bl'
+      | 'resize-br'
+      | 'crop-tl'
+      | 'crop-t'
+      | 'crop-tr'
+      | 'crop-r'
+      | 'crop-br'
+      | 'crop-b'
+      | 'crop-bl'
+      | 'crop-l'
+      | 'crop-move';
     img: ImageBox;
-    initialBounds: { x0: number; y0: number; x1: number; y1: number };
+    initialBounds: RectBounds;
+    fullBounds?: RectBounds;
+    initialCrop?: ImageCrop;
     startDoc: Pt;
   } | null = null;
 
@@ -540,16 +564,39 @@ export class InkSurface {
 
     const lm = this.layerMap();
     // Draw user-inserted Question / Exercise photos underneath or at their layer level
+    const croppingImgId = this.opts.getCroppingImageId?.() ?? null;
+    const draftCrop = croppingImgId ? this.opts.getDraftCrop?.() ?? null : null;
     const pageImages = this.opts.getImages?.() ?? [];
     for (const img of pageImages) {
       const l = lm.get(img.layerId);
       if (l && !l.visible) continue;
       const cached = this.imageElements.get(img.assetId);
+      const isCroppingThis = croppingImgId === img.id;
+      const crop = normalizeImageCrop(img.crop);
       const w = img.bounds.x1 - img.bounds.x0;
       const h = img.bounds.y1 - img.bounds.y0;
+      ctx.save();
       ctx.globalAlpha = (img.opacity ?? 1) * (l?.opacity ?? 1);
       if (cached && cached.complete && cached.naturalWidth > 0) {
-        ctx.drawImage(cached, img.bounds.x0, img.bounds.y0, w, h);
+        if (isCroppingThis) {
+          const full = getFullImageBounds(img);
+          const fw = full.x1 - full.x0;
+          const fh = full.y1 - full.y0;
+          ctx.drawImage(cached, full.x0, full.y0, fw, fh);
+          const dc = normalizeImageCrop(draftCrop ?? img.crop);
+          const cb = getCropBoxBounds(full, dc);
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.52)';
+          if (cb.y0 > full.y0) ctx.fillRect(full.x0, full.y0, fw, cb.y0 - full.y0);
+          if (cb.y1 < full.y1) ctx.fillRect(full.x0, cb.y1, fw, full.y1 - cb.y1);
+          if (cb.x0 > full.x0) ctx.fillRect(full.x0, cb.y0, cb.x0 - full.x0, cb.y1 - cb.y0);
+          if (cb.x1 < full.x1) ctx.fillRect(cb.x1, cb.y0, full.x1 - cb.x1, cb.y1 - cb.y0);
+        } else {
+          const sx = crop.left * cached.naturalWidth;
+          const sy = crop.top * cached.naturalHeight;
+          const sw = Math.max(1, (1 - crop.left - crop.right) * cached.naturalWidth);
+          const sh = Math.max(1, (1 - crop.top - crop.bottom) * cached.naturalHeight);
+          ctx.drawImage(cached, sx, sy, sw, sh, img.bounds.x0, img.bounds.y0, w, h);
+        }
       } else {
         // Placeholder outline while async loading from IndexedDB blobStore
         ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.06)' : 'rgba(0, 0, 0, 0.05)';
@@ -561,7 +608,7 @@ export class InkSurface {
           void this.loadImageAsset(img.assetId);
         }
       }
-      ctx.globalAlpha = 1;
+      ctx.restore();
     }
 
     ctx.strokeStyle = paper.line;
@@ -638,30 +685,76 @@ export class InkSurface {
       const selectedImg = pageImages.find((im) => im.id === selImgId);
       if (selectedImg) {
         ctx.save();
-        ctx.strokeStyle = '#0A84FF';
-        ctx.lineWidth = 1.8 / this.view.scale;
-        ctx.setLineDash([5 / this.view.scale, 3.5 / this.view.scale]);
-        ctx.strokeRect(
-          selectedImg.bounds.x0 - 2,
-          selectedImg.bounds.y0 - 2,
-          selectedImg.bounds.x1 - selectedImg.bounds.x0 + 4,
-          selectedImg.bounds.y1 - selectedImg.bounds.y0 + 4,
-        );
-        ctx.setLineDash([]);
-        const hs = 6.5 / this.view.scale;
-        for (const [hx, hy] of [
-          [selectedImg.bounds.x0, selectedImg.bounds.y0],
-          [selectedImg.bounds.x1, selectedImg.bounds.y0],
-          [selectedImg.bounds.x0, selectedImg.bounds.y1],
-          [selectedImg.bounds.x1, selectedImg.bounds.y1],
-        ]) {
-          ctx.beginPath();
-          ctx.arc(hx, hy, hs, 0, Math.PI * 2);
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fill();
-          ctx.strokeStyle = '#0A84FF';
+        if (croppingImgId === selectedImg.id) {
+          const full = getFullImageBounds(selectedImg);
+          const dc = normalizeImageCrop(draftCrop ?? selectedImg.crop);
+          const cb = getCropBoxBounds(full, dc);
+          const cw = cb.x1 - cb.x0;
+          const ch = cb.y1 - cb.y0;
+          // Crisp white crop border
+          ctx.strokeStyle = '#FFFFFF';
           ctx.lineWidth = 2 / this.view.scale;
+          ctx.strokeRect(cb.x0, cb.y0, cw, ch);
+          // Subtle rule-of-thirds guides
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+          ctx.lineWidth = 0.85 / this.view.scale;
+          ctx.beginPath();
+          ctx.moveTo(cb.x0 + cw / 3, cb.y0);
+          ctx.lineTo(cb.x0 + cw / 3, cb.y1);
+          ctx.moveTo(cb.x0 + (2 * cw) / 3, cb.y0);
+          ctx.lineTo(cb.x0 + (2 * cw) / 3, cb.y1);
+          ctx.moveTo(cb.x0, cb.y0 + ch / 3);
+          ctx.lineTo(cb.x1, cb.y0 + ch / 3);
+          ctx.moveTo(cb.x0, cb.y0 + (2 * ch) / 3);
+          ctx.lineTo(cb.x1, cb.y0 + (2 * ch) / 3);
           ctx.stroke();
+          // 8 crop handles (corners + edge midpoints)
+          const hs = 6.5 / this.view.scale;
+          for (const [hx, hy] of [
+            [cb.x0, cb.y0],
+            [(cb.x0 + cb.x1) * 0.5, cb.y0],
+            [cb.x1, cb.y0],
+            [cb.x1, (cb.y0 + cb.y1) * 0.5],
+            [cb.x1, cb.y1],
+            [(cb.x0 + cb.x1) * 0.5, cb.y1],
+            [cb.x0, cb.y1],
+            [cb.x0, (cb.y0 + cb.y1) * 0.5],
+          ]) {
+            ctx.beginPath();
+            ctx.arc(hx, hy, hs, 0, Math.PI * 2);
+            ctx.fillStyle = '#0A84FF';
+            ctx.fill();
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.lineWidth = 2 / this.view.scale;
+            ctx.stroke();
+          }
+        } else {
+          const pad = 2.5 / this.view.scale;
+          ctx.strokeStyle = '#0A84FF';
+          ctx.lineWidth = 1.8 / this.view.scale;
+          ctx.setLineDash([5 / this.view.scale, 3.5 / this.view.scale]);
+          ctx.strokeRect(
+            selectedImg.bounds.x0 - pad,
+            selectedImg.bounds.y0 - pad,
+            selectedImg.bounds.x1 - selectedImg.bounds.x0 + pad * 2,
+            selectedImg.bounds.y1 - selectedImg.bounds.y0 + pad * 2,
+          );
+          ctx.setLineDash([]);
+          const hs = 7.5 / this.view.scale;
+          for (const [hx, hy] of [
+            [selectedImg.bounds.x0, selectedImg.bounds.y0],
+            [selectedImg.bounds.x1, selectedImg.bounds.y0],
+            [selectedImg.bounds.x0, selectedImg.bounds.y1],
+            [selectedImg.bounds.x1, selectedImg.bounds.y1],
+          ]) {
+            ctx.beginPath();
+            ctx.arc(hx, hy, hs, 0, Math.PI * 2);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fill();
+            ctx.strokeStyle = '#0A84FF';
+            ctx.lineWidth = 2 / this.view.scale;
+            ctx.stroke();
+          }
         }
         ctx.restore();
       }
@@ -1168,33 +1261,71 @@ export class InkSurface {
       }
     }
 
-    // Image manipulation (resize handles or drag to move selected image)
-    const selImgId = this.opts.getSelectedImageId?.();
+    const croppingImgId = this.opts.getCroppingImageId?.() ?? null;
+    // Image manipulation (crop handles, resize handles, drag to move, or image-edit selection)
+    const selImgId = this.opts.getSelectedImageId?.() ?? null;
     if (selImgId && this.activeId === null && !this.penDown) {
       const pageImgs = this.opts.getImages?.() ?? [];
       const selectedImg = pageImgs.find((im) => im.id === selImgId);
       if (selectedImg) {
+        if (croppingImgId === selectedImg.id) {
+          const full = getFullImageBounds(selectedImg);
+          const curCrop = normalizeImageCrop(this.opts.getDraftCrop?.() ?? selectedImg.crop);
+          const cb = getCropBoxBounds(full, curCrop);
+          const cropR = Math.max(10, 24 / this.view.scale);
+          let dragKind:
+            | 'crop-tl'
+            | 'crop-t'
+            | 'crop-tr'
+            | 'crop-r'
+            | 'crop-br'
+            | 'crop-b'
+            | 'crop-bl'
+            | 'crop-l'
+            | 'crop-move'
+            | null = null;
+          if (Math.hypot(d.x - cb.x0, d.y - cb.y0) <= cropR) dragKind = 'crop-tl';
+          else if (Math.hypot(d.x - cb.x1, d.y - cb.y0) <= cropR) dragKind = 'crop-tr';
+          else if (Math.hypot(d.x - cb.x0, d.y - cb.y1) <= cropR) dragKind = 'crop-bl';
+          else if (Math.hypot(d.x - cb.x1, d.y - cb.y1) <= cropR) dragKind = 'crop-br';
+          else if (Math.hypot(d.x - (cb.x0 + cb.x1) * 0.5, d.y - cb.y0) <= cropR) dragKind = 'crop-t';
+          else if (Math.hypot(d.x - cb.x1, d.y - (cb.y0 + cb.y1) * 0.5) <= cropR) dragKind = 'crop-r';
+          else if (Math.hypot(d.x - (cb.x0 + cb.x1) * 0.5, d.y - cb.y1) <= cropR) dragKind = 'crop-b';
+          else if (Math.hypot(d.x - cb.x0, d.y - (cb.y0 + cb.y1) * 0.5) <= cropR) dragKind = 'crop-l';
+          else if (d.x >= cb.x0 && d.x <= cb.x1 && d.y >= cb.y0 && d.y <= cb.y1) dragKind = 'crop-move';
+          e.preventDefault();
+          if (dragKind) {
+            try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+            this.activeId = e.pointerId;
+            this.activeSessionToken = ++this.sessionCounter;
+            this.sessionStartTs = e.timeStamp;
+            this.activeType = e.pointerType;
+            this.imageDrag = {
+              kind: dragKind,
+              img: selectedImg,
+              initialBounds: { ...cb },
+              fullBounds: full,
+              initialCrop: curCrop,
+              startDoc: d,
+            };
+          }
+          return;
+        }
         const b = selectedImg.bounds;
-        const cornerR = Math.max(16, 20 / this.view.scale);
-        let dragKind: 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br' | 'move' | null = null;
+        const bw = b.x1 - b.x0;
+        const bh = b.y1 - b.y0;
+        const cornerR = Math.min(Math.max(bw, bh) * 0.45 + 6, Math.max(10, 24 / this.view.scale));
+        let dragKind: 'move' | 'resize-tl' | 'resize-tr' | 'resize-bl' | 'resize-br' | null = null;
         if (Math.hypot(d.x - b.x0, d.y - b.y0) <= cornerR) dragKind = 'resize-tl';
         else if (Math.hypot(d.x - b.x1, d.y - b.y0) <= cornerR) dragKind = 'resize-tr';
         else if (Math.hypot(d.x - b.x0, d.y - b.y1) <= cornerR) dragKind = 'resize-bl';
         else if (Math.hypot(d.x - b.x1, d.y - b.y1) <= cornerR) dragKind = 'resize-br';
-        else if (
-          (tool.kind === 'text' || tool.kind === 'lasso' || tool.kind === 'hand') &&
-          d.x >= b.x0 && d.x <= b.x1 && d.y >= b.y0 && d.y <= b.y1
-        ) {
+        else if (d.x >= b.x0 && d.x <= b.x1 && d.y >= b.y0 && d.y <= b.y1) {
           dragKind = 'move';
         }
-
         if (dragKind) {
           e.preventDefault();
-          try {
-            this.live.setPointerCapture(e.pointerId);
-          } catch {
-            /* synthetic */
-          }
+          try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
           this.activeId = e.pointerId;
           this.activeSessionToken = ++this.sessionCounter;
           this.sessionStartTs = e.timeStamp;
@@ -1208,6 +1339,56 @@ export class InkSurface {
           return;
         }
       }
+    }
+
+    if (croppingImgId && this.touches.size <= 1) {
+      return;
+    }
+
+    if (this.opts.isImageEditMode?.() && this.activeId === null && !this.penDown) {
+      const images = this.opts.getImages?.() ?? [];
+      const lm = this.layerMap();
+      const pad = Math.max(4, 8 / this.view.scale);
+      const hitImg = [...images].reverse().find((im) => {
+        const l = lm.get(im.layerId);
+        if (l && (!l.visible || l.locked)) return false;
+        return (
+          d.x >= im.bounds.x0 - pad &&
+          d.x <= im.bounds.x1 + pad &&
+          d.y >= im.bounds.y0 - pad &&
+          d.y <= im.bounds.y1 + pad
+        );
+      });
+      if (e.pointerType === 'touch' && this.touches.size === 1) {
+        e.preventDefault();
+        try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+        this.activeId = e.pointerId;
+        this.activeSessionToken = ++this.sessionCounter;
+        this.sessionStartTs = e.timeStamp;
+        this.activeType = e.pointerType;
+        this.mode = 'pan';
+        this.panLast = { x: e.clientX, y: e.clientY };
+        this.panTap = { startX: e.clientX, startY: e.clientY, startTime: performance.now(), docPt: d, moved: false };
+        return;
+      }
+      e.preventDefault();
+      if (hitImg) {
+        this.opts.onImageSelect?.(hitImg);
+        try { this.live.setPointerCapture(e.pointerId); } catch { /* synthetic */ }
+        this.activeId = e.pointerId;
+        this.activeSessionToken = ++this.sessionCounter;
+        this.sessionStartTs = e.timeStamp;
+        this.activeType = e.pointerType;
+        this.imageDrag = {
+          kind: 'move',
+          img: hitImg,
+          initialBounds: { ...hitImg.bounds },
+          startDoc: d,
+        };
+      } else {
+        this.opts.onImageSelect?.(null);
+      }
+      return;
     }
 
     let action = arbitrate(e.pointerType, {
@@ -1337,10 +1518,12 @@ export class InkSurface {
         this.snappedShape = null;
         this.liveSeed = (Date.now() * 137) % 360;
         this.t0 = e.timeStamp;
+        this.lastStrokeTMs = null;
         this.addSamples([e]);
         break;
       case 'pan':
         this.panLast = { x: e.clientX, y: e.clientY };
+        this.panTap = null;
         break;
       case 'erase':
         this.eraseTouched.clear();
@@ -1367,9 +1550,12 @@ export class InkSurface {
     const tool = this.opts.getTool();
     const r = this.activeStrokeRect ?? this.rect();
     const v = this.activeStrokeView ?? this.view;
-    for (const ev of evs) {
+    const tList = normalizeCoalescedTimestamps(evs, this.lastStrokeTMs, this.t0);
+    if (tList.length) this.lastStrokeTMs = tList[tList.length - 1];
+    for (let idx = 0; idx < evs.length; idx++) {
+      const ev = evs[idx];
       let d = clientToDoc(ev.clientX, ev.clientY, r, v);
-      const tMs = Math.max(0, ev.timeStamp - this.t0);
+      const tMs = Math.max(0, tList[idx] ?? 0);
       const rawP = resolvePressure(ev.pointerType, ev.pressure, tool.constantPressure, this.buf.length > 0);
       let p = rawP;
       if (tool.rulerVisible) {
@@ -1381,16 +1567,16 @@ export class InkSurface {
         }
         d = snapToRuler(d, this.ruler.x, this.ruler.y, this.ruler.angle, 18, RULER_HALF_H, RULER_HALF_LEN);
       } else if (this.stabilizerFilter) {
-        const filtered = this.stabilizerFilter.filterSample(d.x, d.y, rawP, tMs);
+        const filtered = this.stabilizerFilter.filterSample(d.x, d.y, rawP, tMs, v.scale);
         d = { x: filtered.x, y: filtered.y };
         p = filtered.p;
       }
-      // Deduplicate identical zero-movement samples except the very first point
+      // Deduplicate zero-movement samples except the very first point
       if (this.buf.length > 0) {
         const prevOff = (this.buf.length - 1) * SAMPLE_STRIDE;
         const dx = d.x - this.buf.data[prevOff];
         const dy = d.y - this.buf.data[prevOff + 1];
-        if (Math.hypot(dx, dy) < 0.08 && Math.abs(tMs - this.buf.data[prevOff + 5]) < 2) {
+        if (Math.hypot(dx, dy) < 0.08) {
           continue;
         }
       }
@@ -1454,9 +1640,58 @@ export class InkSurface {
       const dx = d.x - this.imageDrag.startDoc.x;
       const dy = d.y - this.imageDrag.startDoc.y;
       const init = this.imageDrag.initialBounds;
-      const ar = this.imageDrag.img.aspectRatio || Math.max(0.1, (init.x1 - init.x0) / Math.max(1, init.y1 - init.y0));
+
+      if (this.imageDrag.kind.startsWith('crop-') && this.imageDrag.fullBounds) {
+        const full = this.imageDrag.fullBounds;
+        const fw = Math.max(1e-3, full.x1 - full.x0);
+        const fh = Math.max(1e-3, full.y1 - full.y0);
+        const minW = fw * 0.05;
+        const minH = fh * 0.05;
+        let x0 = init.x0;
+        let y0 = init.y0;
+        let x1 = init.x1;
+        let y1 = init.y1;
+        const clamp = (val: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, val));
+        if (this.imageDrag.kind === 'crop-move') {
+          const cw = x1 - x0;
+          const ch = y1 - y0;
+          x0 = clamp(init.x0 + dx, full.x0, full.x1 - cw);
+          y0 = clamp(init.y0 + dy, full.y0, full.y1 - ch);
+          x1 = x0 + cw;
+          y1 = y0 + ch;
+        } else {
+          if (this.imageDrag.kind === 'crop-l' || this.imageDrag.kind === 'crop-tl' || this.imageDrag.kind === 'crop-bl') {
+            x0 = clamp(init.x0 + dx, full.x0, init.x1 - minW);
+          }
+          if (this.imageDrag.kind === 'crop-r' || this.imageDrag.kind === 'crop-tr' || this.imageDrag.kind === 'crop-br') {
+            x1 = clamp(init.x1 + dx, init.x0 + minW, full.x1);
+          }
+          if (this.imageDrag.kind === 'crop-t' || this.imageDrag.kind === 'crop-tl' || this.imageDrag.kind === 'crop-tr') {
+            y0 = clamp(init.y0 + dy, full.y0, init.y1 - minH);
+          }
+          if (this.imageDrag.kind === 'crop-b' || this.imageDrag.kind === 'crop-bl' || this.imageDrag.kind === 'crop-br') {
+            y1 = clamp(init.y1 + dy, init.y0 + minH, full.y1);
+          }
+        }
+        const nextCrop = normalizeImageCrop({
+          left: (x0 - full.x0) / fw,
+          top: (y0 - full.y0) / fh,
+          right: (full.x1 - x1) / fw,
+          bottom: (full.y1 - y1) / fh,
+        });
+        this.opts.onDraftCropChange?.(nextCrop);
+        this.invalidate();
+        return;
+      }
+
+      const initW = Math.max(1, init.x1 - init.x0);
+      const initH = Math.max(1, init.y1 - init.y0);
+      const ar = this.imageDrag.img.aspectRatio || Math.max(0.1, initW / initH);
       const pW = this.page?.width ?? 600;
       const pH = this.page?.height ?? 800;
+
+      const minHForMinW = 40 / ar;
+      const minW = Math.max(40, minHForMinW >= 40 ? 40 : 40 * ar);
 
       if (this.imageDrag.kind === 'move') {
         const w = init.x1 - init.x0;
@@ -1464,38 +1699,33 @@ export class InkSurface {
         const nx0 = Math.max(0, Math.min(pW - w, init.x0 + dx));
         const ny0 = Math.max(0, Math.min(pH - h, init.y0 + dy));
         this.imageDrag.img.bounds = { x0: nx0, y0: ny0, x1: nx0 + w, y1: ny0 + h };
-      } else if (this.imageDrag.kind === 'resize-br') {
-        let w = Math.max(60, Math.min(pW - init.x0, init.x1 - init.x0 + dx));
-        let h = w / ar;
-        if (init.y0 + h > pH) {
-          h = pH - init.y0;
-          w = h * ar;
+      } else {
+        let w = initW;
+        if (this.imageDrag.kind === 'resize-br') {
+          w = Math.abs(dx / initW) >= Math.abs(dy / initH) ? initW + dx : (initH + dy) * ar;
+          const maxW = Math.min(pW - init.x0, (pH - init.y0) * ar);
+          w = Math.max(Math.min(minW, maxW), Math.min(maxW, w));
+          const h = w / ar;
+          this.imageDrag.img.bounds = { x0: init.x0, y0: init.y0, x1: init.x0 + w, y1: init.y0 + h };
+        } else if (this.imageDrag.kind === 'resize-bl') {
+          w = Math.abs(dx / initW) >= Math.abs(dy / initH) ? initW - dx : (initH + dy) * ar;
+          const maxW = Math.min(init.x1, (pH - init.y0) * ar);
+          w = Math.max(Math.min(minW, maxW), Math.min(maxW, w));
+          const h = w / ar;
+          this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y0, x1: init.x1, y1: init.y0 + h };
+        } else if (this.imageDrag.kind === 'resize-tr') {
+          w = Math.abs(dx / initW) >= Math.abs(dy / initH) ? initW + dx : (initH - dy) * ar;
+          const maxW = Math.min(pW - init.x0, init.y1 * ar);
+          w = Math.max(Math.min(minW, maxW), Math.min(maxW, w));
+          const h = w / ar;
+          this.imageDrag.img.bounds = { x0: init.x0, y0: init.y1 - h, x1: init.x0 + w, y1: init.y1 };
+        } else if (this.imageDrag.kind === 'resize-tl') {
+          w = Math.abs(dx / initW) >= Math.abs(dy / initH) ? initW - dx : (initH - dy) * ar;
+          const maxW = Math.min(init.x1, init.y1 * ar);
+          w = Math.max(Math.min(minW, maxW), Math.min(maxW, w));
+          const h = w / ar;
+          this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y1 - h, x1: init.x1, y1: init.y1 };
         }
-        this.imageDrag.img.bounds = { x0: init.x0, y0: init.y0, x1: init.x0 + w, y1: init.y0 + h };
-      } else if (this.imageDrag.kind === 'resize-bl') {
-        let w = Math.max(60, Math.min(init.x1, init.x1 - (init.x0 + dx)));
-        let h = w / ar;
-        if (init.y0 + h > pH) {
-          h = pH - init.y0;
-          w = h * ar;
-        }
-        this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y0, x1: init.x1, y1: init.y0 + h };
-      } else if (this.imageDrag.kind === 'resize-tr') {
-        let w = Math.max(60, Math.min(pW - init.x0, init.x1 - init.x0 + dx));
-        let h = w / ar;
-        if (init.y1 - h < 0) {
-          h = init.y1;
-          w = h * ar;
-        }
-        this.imageDrag.img.bounds = { x0: init.x0, y0: init.y1 - h, x1: init.x0 + w, y1: init.y1 };
-      } else if (this.imageDrag.kind === 'resize-tl') {
-        let w = Math.max(60, Math.min(init.x1, init.x1 - (init.x0 + dx)));
-        let h = w / ar;
-        if (init.y1 - h < 0) {
-          h = init.y1;
-          w = h * ar;
-        }
-        this.imageDrag.img.bounds = { x0: init.x1 - w, y0: init.y1 - h, x1: init.x1, y1: init.y1 };
       }
       this.invalidate();
       return;
@@ -1523,6 +1753,9 @@ export class InkSurface {
         this.addSamples(evs);
         break;
       case 'pan':
+        if (this.panTap && !this.panTap.moved && Math.hypot(e.clientX - this.panTap.startX, e.clientY - this.panTap.startY) > 6) {
+          this.panTap.moved = true;
+        }
         if (this.panLast) {
           const dx = e.clientX - this.panLast.x;
           const dy = e.clientY - this.panLast.y;
@@ -1613,9 +1846,19 @@ export class InkSurface {
       return;
     }
     if (this.imageDrag) {
-      const prev = { ...this.imageDrag.img, bounds: { ...this.imageDrag.initialBounds } };
-      const next = { ...this.imageDrag.img, bounds: { ...this.imageDrag.img.bounds }, revision: this.imageDrag.img.revision + 1 };
+      const drag = this.imageDrag;
       this.imageDrag = null;
+      if (drag.kind.startsWith('crop-')) {
+        this.invalidate();
+        return;
+      }
+      const prev = { ...drag.img, bounds: { ...drag.initialBounds } };
+      const next = {
+        ...drag.img,
+        bounds: { ...drag.img.bounds },
+        aspectRatio: prev.aspectRatio,
+        revision: drag.img.revision + 1,
+      };
       if (
         Math.abs(next.bounds.x0 - prev.bounds.x0) > 0.5 ||
         Math.abs(next.bounds.y0 - prev.bounds.y0) > 0.5 ||
@@ -1630,16 +1873,59 @@ export class InkSurface {
     }
     switch (mode) {
       case 'ink':
-        // Append the real pointerup endpoint if it moved from the last recorded sample
+        // Append the real pointerup endpoint if it moved cleanly without a pen lift-off backward hook
         if (this.buf && this.buf.length > 0 && !this.snappedShape) {
-          this.addSamples([e]);
+          const prev = clientToDoc(
+            e.clientX,
+            e.clientY,
+            this.activeStrokeRect ?? this.rect(),
+            this.activeStrokeView ?? this.view,
+          );
+          const o = (this.buf.length - 1) * SAMPLE_STRIDE;
+          const tx = prev.x - this.buf.data[o];
+          const ty = prev.y - this.buf.data[o + 1];
+          const tl = Math.hypot(tx, ty);
+          let isLiftHook = false;
+          if (e.pointerType === 'pen' && this.buf.length >= 2 && tl > 0.08 && tl <= 4.0) {
+            const p0 = (this.buf.length - 2) * SAMPLE_STRIDE;
+            const sx = this.buf.data[o] - this.buf.data[p0];
+            const sy = this.buf.data[o + 1] - this.buf.data[p0 + 1];
+            const sl = Math.hypot(sx, sy);
+            if (sl >= 2.0 && (sx * tx + sy * ty) / (sl * tl) < -0.35) {
+              isLiftHook = true;
+            }
+          }
+          if (!isLiftHook && tl >= 0.08) {
+            this.addSamples([e]);
+          }
         }
         this.finishInk();
         break;
       case 'erase': this.finishErase(); break;
       case 'shape': this.finishShape(e); break;
       case 'lasso': this.finishLasso(); break;
-      case 'pan': this.panLast = null; break;
+      case 'pan': {
+        const tap = this.panTap;
+        this.panLast = null;
+        this.panTap = null;
+        if (tap && !tap.moved && performance.now() - tap.startTime < 450 && this.opts.isImageEditMode?.()) {
+          const lm = this.layerMap();
+          const pad = Math.max(4, 8 / this.view.scale);
+          const imgs = this.opts.getImages?.() ?? [];
+          const hitImg = [...imgs].reverse().find((im) => {
+            const l = lm.get(im.layerId);
+            if (l && (!l.visible || l.locked)) return false;
+            return (
+              tap.docPt.x >= im.bounds.x0 - pad &&
+              tap.docPt.x <= im.bounds.x1 + pad &&
+              tap.docPt.y >= im.bounds.y0 - pad &&
+              tap.docPt.y <= im.bounds.y1 + pad
+            );
+          });
+          this.opts.onImageSelect?.(hitImg ?? null);
+        }
+        break;
+      }
       case 'laser': break;
     }
     this.liveDirty = true;
@@ -1715,7 +2001,11 @@ export class InkSurface {
     }
     if (this.drag && this.sel) this.sel.t = { ...ID_T };
     if (this.imageDrag) {
-      this.imageDrag.img.bounds = { ...this.imageDrag.initialBounds };
+      if (this.imageDrag.kind.startsWith('crop-')) {
+        if (this.imageDrag.initialCrop) this.opts.onDraftCropChange?.(this.imageDrag.initialCrop);
+      } else {
+        this.imageDrag.img.bounds = { ...this.imageDrag.initialBounds };
+      }
       this.imageDrag = null;
     }
     clearTimeout(this.holdTimer);
@@ -1725,6 +2015,8 @@ export class InkSurface {
     this.activeId = null;
     this.activeSessionToken = 0;
     this.buf = null;
+    this.lastStrokeTMs = null;
+    this.panTap = null;
     this.stabilizerFilter = null;
     this.activeStrokeRect = null;
     this.activeStrokeView = null;
@@ -1760,11 +2052,12 @@ export class InkSurface {
       });
       return;
     }
-    const samples = buf.toArray();
+    const rawSamples = buf.toArray();
     if (type === 'pen') {
       const o = (buf.length - 1) * SAMPLE_STRIDE + 2;
-      if (samples[o] <= 0) samples[o] = 0.05;
+      if (rawSamples[o] <= 0) rawSamples[o] = 0.05;
     }
+    const samples = cleanStrokeSamples(rawSamples, width);
     // scribble-to-erase: recognise before committing; fall back to ink when uncertain
     if (tool.kind === 'pen' && tool.scribbleErase) {
       const sc = detectScribble(samples);

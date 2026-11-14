@@ -140,14 +140,99 @@ export interface TextBox {
   revision: number;
 }
 
+export interface ImageCrop {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+const MIN_CROP_SPAN = 0.05;
+const clamp01 = (v: number) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0);
+
+export function normalizeImageCrop(crop?: Partial<ImageCrop> | null): ImageCrop {
+  let left = clamp01(crop?.left ?? 0);
+  let top = clamp01(crop?.top ?? 0);
+  let right = clamp01(crop?.right ?? 0);
+  let bottom = clamp01(crop?.bottom ?? 0);
+  if (left + right > 1 - MIN_CROP_SPAN) {
+    const excess = left + right - (1 - MIN_CROP_SPAN);
+    const total = left + right;
+    if (total > 0) {
+      left = Math.max(0, left - (excess * left) / total);
+      right = Math.max(0, right - (excess * right) / total);
+    } else {
+      left = 0;
+      right = 0;
+    }
+  }
+  if (top + bottom > 1 - MIN_CROP_SPAN) {
+    const excess = top + bottom - (1 - MIN_CROP_SPAN);
+    const total = top + bottom;
+    if (total > 0) {
+      top = Math.max(0, top - (excess * top) / total);
+      bottom = Math.max(0, bottom - (excess * bottom) / total);
+    } else {
+      top = 0;
+      bottom = 0;
+    }
+  }
+  return { left, top, right, bottom };
+}
+
+export interface RectBounds {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export function isDefaultImageCrop(crop?: Partial<ImageCrop> | null): boolean {
+  if (!crop) return true;
+  const n = normalizeImageCrop(crop);
+  return n.left < 1e-4 && n.top < 1e-4 && n.right < 1e-4 && n.bottom < 1e-4;
+}
+
+export function getFullImageBounds(img: Pick<ImageBox, 'bounds' | 'crop'>): RectBounds {
+  const c = normalizeImageCrop(img.crop);
+  const visW = Math.max(1e-3, img.bounds.x1 - img.bounds.x0);
+  const visH = Math.max(1e-3, img.bounds.y1 - img.bounds.y0);
+  const spanX = Math.max(MIN_CROP_SPAN, 1 - c.left - c.right);
+  const spanY = Math.max(MIN_CROP_SPAN, 1 - c.top - c.bottom);
+  const fullW = visW / spanX;
+  const fullH = visH / spanY;
+  const x0 = img.bounds.x0 - c.left * fullW;
+  const y0 = img.bounds.y0 - c.top * fullH;
+  return {
+    x0,
+    y0,
+    x1: x0 + fullW,
+    y1: y0 + fullH,
+  };
+}
+
+export function getCropBoxBounds(fullBounds: RectBounds, crop?: Partial<ImageCrop> | null): RectBounds {
+  const c = normalizeImageCrop(crop);
+  const fullW = Math.max(1e-3, fullBounds.x1 - fullBounds.x0);
+  const fullH = Math.max(1e-3, fullBounds.y1 - fullBounds.y0);
+  return {
+    x0: fullBounds.x0 + c.left * fullW,
+    y0: fullBounds.y0 + c.top * fullH,
+    x1: fullBounds.x1 - c.right * fullW,
+    y1: fullBounds.y1 - c.bottom * fullH,
+  };
+}
+
 export interface ImageBox {
   kind: 'image';
   id: string;
   pageId: string;
   layerId: string;
   assetId: string;
-  bounds: { x0: number; y0: number; x1: number; y1: number };
+  bounds: RectBounds;
   aspectRatio: number;
+  naturalAspectRatio?: number;
+  crop?: ImageCrop;
   opacity: number;
   order: number;
   revision: number;

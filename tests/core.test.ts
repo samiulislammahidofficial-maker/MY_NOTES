@@ -31,16 +31,38 @@ if (typeof globalThis !== 'undefined' && typeof (globalThis as any).Path2D === '
     ops: any[] = [];
     moveTo(x: number, y: number) { this.ops.push(['moveTo', x, y]); }
     lineTo(x: number, y: number) { this.ops.push(['lineTo', x, y]); }
+    quadraticCurveTo(cpx: number, cpy: number, x: number, y: number) {
+      this.ops.push(['quadraticCurveTo', cpx, cpy, x, y]);
+    }
     arc(x: number, y: number, r: number, s: number, e: number) { this.ops.push(['arc', x, y, r, s, e]); }
     closePath() { this.ops.push(['closePath']); }
   }
   Object.defineProperty(globalThis, 'Path2D', { value: MockPath2D, configurable: true, writable: true });
 }
+import { deflateSync } from 'node:zlib';
 import { clientToDoc, constrainView, docToClient, fitPage, zoomAbout } from '../src/domain/geometry';
 import { AddPageCommand, AddStrokeCommand, History, ReplaceCommand, UpdateImageBoxCommand, deserializeCommand, type StrokeTarget } from '../src/domain/history';
 import { isDrawingOrManipulationTool, isAllowedTextSelectionTarget } from '../src/engine/selectionGuard';
-import type { ImageBox } from '../src/domain/types';
-import { SampleBuffer, arbitrate, expandEvents, resolvePressure } from '../src/engine/input';
+import {
+  SAMPLE_STRIDE,
+  getCropBoxBounds,
+  getFullImageBounds,
+  isDefaultImageCrop,
+  normalizeImageCrop,
+  type ImageBox,
+  type InkStroke,
+  type Layer,
+  type Notebook,
+  type Page,
+} from '../src/domain/types';
+import {
+  SampleBuffer,
+  StrokeStabilizer,
+  arbitrate,
+  expandEvents,
+  normalizeCoalescedTimestamps,
+  resolvePressure,
+} from '../src/engine/input';
 import {
   eraseCircle,
   fitShape,
@@ -59,12 +81,12 @@ import {
   SwipeToAddController,
 } from '../src/engine/swipeAddPage';
 import { detectScribble } from '../src/engine/scribble';
-import { boundsOf, strokePath } from '../src/engine/render';
+import { boundsOf, centerlinePath, cleanStrokeSamples, strokePath } from '../src/engine/render';
 import { writingDiagnostics } from '../src/engine/diagnostics';
 import { PenDiagnosticEngine } from '../src/engine/penDiagnosticEngine';
 import { exportNotebookToPdfBytes, exportPageToJpgBytes, parsePageRange } from '../src/pdf/pdfManager';
+import { blobStore } from '../src/storage/blobStore';
 import { PDFDocument } from 'pdf-lib';
-import { SAMPLE_STRIDE, type InkStroke, type Layer, type Notebook, type Page } from '../src/domain/types';
 
 const rect = { left: 40, top: 20 };
 
@@ -1228,6 +1250,263 @@ describe('image insertion, manipulation, undo/redo, and selection protection', (
       expect(bytes.byteLength).toBeGreaterThan(2);
       expect(bytes[0]).toBe(0xff);
       expect(bytes[1]).toBe(0xd8);
+    });
+  });
+
+  describe('smooth ink pipeline & outlier cleanup', () => {
+    it('normalizeCoalescedTimestamps spaces shared frame timestamps monotonically', () => {
+      const ts = normalizeCoalescedTimestamps(
+        [{ timeStamp: 1008 }, { timeStamp: 1008 }, { timeStamp: 1008 }],
+        0,
+        1000,
+      );
+      expect(ts).toHaveLength(3);
+      expect(ts[0]).toBeGreaterThan(0);
+      expect(ts[1]).toBeGreaterThan(ts[0]);
+      expect(ts[2]).toBeCloseTo(8, 5);
+
+      const lift = normalizeCoalescedTimestamps([{ timeStamp: 1008 }], 8, 1000);
+      expect(lift[0]).toBeGreaterThan(8);
+    });
+
+    it('StrokeStabilizer applies isotropic 2D smoothing without diagonal axis lag', () => {
+      const stab = new StrokeStabilizer('low');
+      // 20-degree shallow diagonal where 1D X/Y filters previously had different cutoffs
+      const cos20 = Math.cos(Math.PI / 9);
+      const sin20 = Math.sin(Math.PI / 9);
+      const maxPerpErr: number[] = [];
+      for (let i = 0; i <= 20; i++) {
+        const s = i * 4;
+        const rawX = s * cos20;
+        const rawY = s * sin20;
+        // Simulate shared coalesced timestamps inside pairs at 222% zoom
+        const tMs = Math.floor(i / 2) * 8 + (i % 2 === 0 ? 0 : 0);
+        const out = stab.filterSample(rawX, rawY, 0.5, i === 0 ? 0 : tMs + 4, 2.22);
+        const perp = Math.abs(out.x * -sin20 + out.y * cos20);
+        maxPerpErr.push(perp);
+      }
+      expect(Math.max(...maxPerpErr)).toBeLessThan(1e-6);
+    });
+
+    it('cleanStrokeSamples strips sideways spikes & lift-off hooks while keeping sharp corners and dots', () => {
+      const pack = (pts: [number, number][]) => {
+        const out = new Float32Array(pts.length * SAMPLE_STRIDE);
+        pts.forEach(([x, y], i) => out.set([x, y, 0.5, 0, 0, i * 8], i * SAMPLE_STRIDE));
+        return out;
+      };
+
+      // Diagonal stroke with an isolated 1-sample sideways jitter spike at (10, 13) and tiny backward lift hook
+      const spiked = pack([
+        [0, 0],
+        [4, 4],
+        [8, 8],
+        [9.2, 12.1],
+        [12, 12],
+        [16, 16],
+        [20, 20],
+        [18.6, 19.2],
+      ]);
+      const cleaned = cleanStrokeSamples(spiked, 2);
+      const keptPts: [number, number][] = [];
+      for (let i = 0; i < cleaned.length; i += SAMPLE_STRIDE) {
+        keptPts.push([cleaned[i], cleaned[i + 1]]);
+      }
+      expect(keptPts.some(([x, y]) => Math.abs(x - 9.2) < 0.01 && Math.abs(y - 12.1) < 0.01)).toBe(false);
+      expect(keptPts.some(([x, y]) => Math.abs(x - 18.6) < 0.01 && Math.abs(y - 19.2) < 0.01)).toBe(false);
+      expect(keptPts[keptPts.length - 1]).toEqual([20, 20]);
+
+      // Deliberate sharp V corner must retain exact vertex
+      const sharpV = pack([
+        [0, 0],
+        [4, 8],
+        [8, 16],
+        [12, 24],
+        [16, 16],
+        [20, 8],
+        [24, 0],
+      ]);
+      const cleanedV = cleanStrokeSamples(sharpV, 2);
+      expect(cleanedV.length / SAMPLE_STRIDE).toBe(7);
+      expect(cleanedV[3 * SAMPLE_STRIDE]).toBe(12);
+      expect(cleanedV[3 * SAMPLE_STRIDE + 1]).toBe(24);
+
+      // Single-point dot stays intact
+      const dot = pack([[42, 64]]);
+      expect(cleanStrokeSamples(dot, 2).length / SAMPLE_STRIDE).toBe(1);
+
+      // strokePath & centerlinePath produce smooth quadratic curves
+      const path = strokePath({ samples: sharpV, width: 2.5, tool: 'ballpoint' }, true) as any;
+      expect(path.ops.some((op: any[]) => op[0] === 'quadraticCurveTo')).toBe(true);
+      const cpath = centerlinePath(sharpV) as any;
+      expect(cpath.ops.some((op: any[]) => op[0] === 'quadraticCurveTo' || op[0] === 'lineTo')).toBe(true);
+    });
+  });
+
+  describe('non-destructive image crop, undo/redo, and export', () => {
+    const crc32 = (buf: Uint8Array) => {
+      let c = 0xffffffff;
+      for (let i = 0; i < buf.length; i++) {
+        c ^= buf[i];
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      }
+      return (c ^ 0xffffffff) >>> 0;
+    };
+    const makePngChunk = (type: string, data: Uint8Array) => {
+      const len = data.length;
+      const out = new Uint8Array(12 + len);
+      const dv = new DataView(out.buffer);
+      dv.setUint32(0, len, false);
+      for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+      out.set(data, 8);
+      dv.setUint32(8 + len, crc32(out.subarray(4, 8 + len)), false);
+      return out;
+    };
+    const makeTinyPng = () => {
+      const ihdr = new Uint8Array(13);
+      const dv = new DataView(ihdr.buffer);
+      dv.setUint32(0, 2, false);
+      dv.setUint32(4, 2, false);
+      ihdr[8] = 8; // bit depth
+      ihdr[9] = 2; // RGB
+      // 2 scanlines of filter=0 + 2 RGB pixels (6 bytes) each
+      const raw = new Uint8Array([0, 255, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255]);
+      const idat = deflateSync(raw);
+      const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+      const c1 = makePngChunk('IHDR', ihdr);
+      const c2 = makePngChunk('IDAT', idat);
+      const c3 = makePngChunk('IEND', new Uint8Array(0));
+      const full = new Uint8Array(sig.length + c1.length + c2.length + c3.length);
+      full.set(sig, 0);
+      full.set(c1, sig.length);
+      full.set(c2, sig.length + c1.length);
+      full.set(c3, sig.length + c1.length + c2.length);
+      return full;
+    };
+
+    it('round-trips full image bounds and normalized crop metadata without losing original aspect', () => {
+      const fullBounds = { x0: 100, y0: 200, x1: 500, y1: 500 }; // 400 x 300
+      const crop = normalizeImageCrop({ left: 0.1, top: 0.2, right: 0.25, bottom: 0.1 });
+      const vis = getCropBoxBounds(fullBounds, crop);
+      expect(vis.x0).toBeCloseTo(140, 5);
+      expect(vis.y0).toBeCloseTo(260, 5);
+      expect(vis.x1).toBeCloseTo(400, 5);
+      expect(vis.y1).toBeCloseTo(470, 5);
+
+      const reconstructed = getFullImageBounds({ bounds: vis, crop });
+      expect(reconstructed.x0).toBeCloseTo(fullBounds.x0, 5);
+      expect(reconstructed.y0).toBeCloseTo(fullBounds.y0, 5);
+      expect(reconstructed.x1).toBeCloseTo(fullBounds.x1, 5);
+      expect(reconstructed.y1).toBeCloseTo(fullBounds.y1, 5);
+
+      expect(isDefaultImageCrop(undefined)).toBe(true);
+      expect(isDefaultImageCrop({ left: 0, top: 0, right: 0, bottom: 0 })).toBe(true);
+      expect(isDefaultImageCrop(crop)).toBe(false);
+    });
+
+    it('UpdateImageBoxCommand updates crop and bounds in place on undo/redo without firing removeImage', () => {
+      const imgStore = new Map<string, ImageBox>();
+      let removeCount = 0;
+      const target: StrokeTarget = {
+        addStroke() {},
+        removeStroke() {},
+        replace() {},
+        insertPage() {},
+        removeAddedPage() {},
+        addImage(im) {
+          imgStore.set(im.id, im);
+        },
+        removeImage(_pid, id) {
+          removeCount++;
+          imgStore.delete(id);
+        },
+      };
+
+      const base: ImageBox = {
+        kind: 'image',
+        id: 'img-crop-1',
+        pageId: 'p1',
+        layerId: 'l1',
+        assetId: 'asset-1',
+        bounds: { x0: 100, y0: 100, x1: 500, y1: 400 },
+        aspectRatio: 4 / 3,
+        naturalAspectRatio: 4 / 3,
+        opacity: 1,
+        order: 1,
+        revision: 1,
+      };
+      const crop = { left: 0.2, top: 0.1, right: 0.2, bottom: 0.1 };
+      const cropped: ImageBox = {
+        ...base,
+        bounds: getCropBoxBounds(base.bounds, crop),
+        crop,
+        aspectRatio: (0.6 * 400) / (0.8 * 300),
+        revision: 2,
+      };
+
+      const history = new History();
+      history.run(new UpdateImageBoxCommand('p1', null, base), target);
+      history.run(new UpdateImageBoxCommand('p1', base, cropped), target);
+      expect(removeCount).toBe(0);
+      expect(imgStore.get('img-crop-1')?.crop).toEqual(crop);
+
+      history.undo(target);
+      expect(removeCount).toBe(0);
+      expect(imgStore.get('img-crop-1')?.bounds).toEqual(base.bounds);
+      expect(imgStore.get('img-crop-1')?.crop).toBeUndefined();
+
+      history.redo(target);
+      expect(imgStore.get('img-crop-1')?.crop).toEqual(crop);
+    });
+
+    it('exportNotebookToPdfBytes clips cropped images without destroying full image dimensions', async () => {
+      const assetId = 'img-png-crop-test';
+      await blobStore.put(assetId, makeTinyPng());
+
+      const nb: Notebook = {
+        id: 'nb-crop-pdf',
+        title: 'Crop PDF',
+        cover: '#385e51',
+        hasCover: false,
+        template: 'blank',
+        size: 'A4',
+        landscape: false,
+        folderId: null,
+        tags: [],
+        pinned: false,
+        trashedAt: null,
+        pageIds: ['p1'],
+        createdAt: 1,
+        updatedAt: 1,
+        revision: 1,
+        paper: '#FFFFFF',
+      };
+      const page: Page = { id: 'p1', notebookId: nb.id, width: 595, height: 842, layerIds: ['l1'], revision: 1 };
+      const layers: Layer[] = [{ id: 'l1', pageId: 'p1', name: 'Ink', visible: true, locked: false, opacity: 1 }];
+      const croppedImg: ImageBox = {
+        kind: 'image',
+        id: 'im1',
+        pageId: 'p1',
+        layerId: 'l1',
+        assetId,
+        bounds: { x0: 140, y0: 140, x1: 380, y1: 320 },
+        aspectRatio: 240 / 180,
+        naturalAspectRatio: 1,
+        crop: { left: 0.25, top: 0.25, right: 0.25, bottom: 0.25 },
+        opacity: 1,
+        order: 1,
+        revision: 1,
+      };
+
+      const bytes = await exportNotebookToPdfBytes(
+        nb,
+        [page],
+        () => [],
+        () => [],
+        () => layers,
+        () => [croppedImg],
+      );
+      const parsed = await PDFDocument.load(bytes);
+      expect(parsed.getPageCount()).toBe(1);
     });
   });
 });

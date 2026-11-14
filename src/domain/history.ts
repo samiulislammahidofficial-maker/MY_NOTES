@@ -99,11 +99,15 @@ export class UpdateTextBoxCommand implements Command {
   readonly label = 'Edit text';
   constructor(private pageId: string, private prev: TextBox | null, private next: TextBox | null) {}
   apply(t: StrokeTarget) {
-    if (this.prev) t.removeText?.(this.pageId, this.prev.id);
+    if (this.prev && (!this.next || this.prev.id !== this.next.id)) {
+      t.removeText?.(this.pageId, this.prev.id);
+    }
     if (this.next) t.addText?.(this.next);
   }
   inverse(t: StrokeTarget) {
-    if (this.next) t.removeText?.(this.pageId, this.next.id);
+    if (this.next && (!this.prev || this.next.id !== this.prev.id)) {
+      t.removeText?.(this.pageId, this.next.id);
+    }
     if (this.prev) t.addText?.(this.prev);
   }
   serialize(): SerializedCommand {
@@ -115,11 +119,15 @@ export class UpdateImageBoxCommand implements Command {
   readonly label = 'Edit image';
   constructor(private pageId: string, private prev: ImageBox | null, private next: ImageBox | null) {}
   apply(t: StrokeTarget) {
-    if (this.prev) t.removeImage?.(this.pageId, this.prev.id);
+    if (this.prev && (!this.next || this.prev.id !== this.next.id)) {
+      t.removeImage?.(this.pageId, this.prev.id);
+    }
     if (this.next) t.addImage?.(this.next);
   }
   inverse(t: StrokeTarget) {
-    if (this.next) t.removeImage?.(this.pageId, this.next.id);
+    if (this.next && (!this.prev || this.next.id !== this.prev.id)) {
+      t.removeImage?.(this.pageId, this.next.id);
+    }
     if (this.prev) t.addImage?.(this.prev);
   }
   serialize(): SerializedCommand {

@@ -22,6 +22,7 @@ import {
   Copy,
   CopyPlus,
   CornerDownLeft,
+  Crop,
   Download,
   Eraser,
   Eye,
@@ -44,6 +45,7 @@ import {
   Plus,
   Printer,
   Redo2,
+  RotateCcw,
   Ruler,
   Scissors,
   Shapes,
@@ -58,7 +60,18 @@ import katex from 'katex';
 import { actions, beginEssentialJob, getActiveLayer, getImages, getLayers, getPages, getStrokes, getTexts, useApp } from './store';
 import { InkSurface } from '../engine/surface';
 import type { SelectionInfo, ShapeKind, ToolKind } from '../engine/tools';
-import { PAPER_COLORS, type ImageBox, type InkStroke, type Page, type TextBox } from '../domain/types';
+import {
+  PAPER_COLORS,
+  getCropBoxBounds,
+  getFullImageBounds,
+  isDefaultImageCrop,
+  normalizeImageCrop,
+  type ImageBox,
+  type ImageCrop,
+  type InkStroke,
+  type Page,
+  type TextBox,
+} from '../domain/types';
 import { unionBounds } from '../engine/hit';
 import { SwipeToAddController, type SwipeAddSnapshot } from '../engine/swipeAddPage';
 import { StyleColorPopover, type StylePopoverTab } from '../ui/StyleColorPopover';
@@ -377,6 +390,10 @@ function ContinuousPageCard({
   onAnyStrokeStart,
   selectedImageId,
   onSelectImage,
+  isImageEditMode,
+  croppingImageId,
+  draftCrop,
+  onDraftCropChange,
   onPinchZoom,
 }: {
   paneIndex: number;
@@ -392,6 +409,10 @@ function ContinuousPageCard({
   onAnyStrokeStart: () => void;
   selectedImageId: string | null;
   onSelectImage: (id: string | null) => void;
+  isImageEditMode: boolean;
+  croppingImageId: string | null;
+  draftCrop: ImageCrop | null;
+  onDraftCropChange: (crop: ImageCrop) => void;
   onPinchZoom?: (factor: number, ended: boolean) => void;
 }) {
   const version = useApp((s) => s.strokeVersion);
@@ -411,6 +432,12 @@ function ContinuousPageCard({
   isActivePageRef.current = isActivePage;
   const selectedImageIdRef = useRef(selectedImageId);
   selectedImageIdRef.current = selectedImageId;
+  const isImageEditModeRef = useRef(isImageEditMode);
+  isImageEditModeRef.current = isImageEditMode;
+  const croppingImageIdRef = useRef(croppingImageId);
+  croppingImageIdRef.current = croppingImageId;
+  const draftCropRef = useRef(draftCrop);
+  draftCropRef.current = draftCrop;
 
   useEffect(() => {
     if (!mountCanvas || !hostRef.current) {
@@ -434,7 +461,16 @@ function ContinuousPageCard({
       getTexts: () => getTexts(page.id),
       getImages: () => getImages(page.id),
       getSelectedImageId: () => (isActivePageRef.current ? selectedImageIdRef.current : null),
-      onImageSelect: (im) => onSelectImage(im?.id ?? null),
+      isImageEditMode: () => isActivePageRef.current && (isImageEditModeRef.current || !!selectedImageIdRef.current),
+      getCroppingImageId: () => (isActivePageRef.current ? croppingImageIdRef.current : null),
+      getDraftCrop: () => (isActivePageRef.current ? draftCropRef.current : null),
+      onDraftCropChange: (crop) => onDraftCropChange(crop),
+      onImageSelect: (im) => {
+        if (im && useApp.getState().panes[paneIndex]?.pageId !== page.id) {
+          actions.setPage(paneIndex, page.id);
+        }
+        onSelectImage(im?.id ?? null);
+      },
       onImageCommit: (prev, next) => actions.commitImageEdit(page.id, prev, next),
       onStroke: (st) => {
         setKeepMountedForStroke(false);
@@ -478,7 +514,7 @@ function ContinuousPageCard({
 
   useEffect(() => {
     surfRef.current?.invalidate();
-  }, [paper, rulerVisible, rulerUnits, isActivePage]);
+  }, [paper, rulerVisible, rulerUnits, isActivePage, selectedImageId, isImageEditMode, croppingImageId, draftCrop, version]);
 
   useEffect(() => {
     if (kind !== 'lasso') surfRef.current?.clearSelection();
@@ -574,15 +610,33 @@ function Pane({
   index,
   selectedImageId,
   onSelectImage,
+  isImageEditMode,
+  croppingImageId,
+  draftCrop,
+  onDraftCropChange,
   onRequestUnlockPage,
 }: {
   index: number;
   selectedImageId: string | null;
   onSelectImage: (id: string | null) => void;
+  isImageEditMode: boolean;
+  croppingImageId: string | null;
+  draftCrop: ImageCrop | null;
+  onDraftCropChange: (crop: ImageCrop) => void;
   onRequestUnlockPage: (page: Page) => void;
 }) {
   const pane = useApp((s) => s.panes[index]);
   const active = useApp((s) => s.activePane === index);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const selectedImageIdRef = useRef(selectedImageId);
+  selectedImageIdRef.current = selectedImageId;
+  const isImageEditModeRef = useRef(isImageEditMode);
+  isImageEditModeRef.current = isImageEditMode;
+  const croppingImageIdRef = useRef(croppingImageId);
+  croppingImageIdRef.current = croppingImageId;
+  const draftCropRef = useRef(draftCrop);
+  draftCropRef.current = draftCrop;
   const paper = useApp((s) => s.paper);
   const version = useApp((s) => s.strokeVersion);
   const kind = useApp((s) => s.tool.kind);
@@ -724,7 +778,11 @@ function Pane({
       activeLayerId: () => getActiveLayer(pageOf() ?? ''),
       getTexts: () => getTexts(pageOf() ?? ''),
       getImages: () => getImages(pageOf() ?? ''),
-      getSelectedImageId: () => (active ? selectedImageId : null),
+      getSelectedImageId: () => (activeRef.current ? selectedImageIdRef.current : null),
+      isImageEditMode: () => activeRef.current && (isImageEditModeRef.current || !!selectedImageIdRef.current),
+      getCroppingImageId: () => (activeRef.current ? croppingImageIdRef.current : null),
+      getDraftCrop: () => (activeRef.current ? draftCropRef.current : null),
+      onDraftCropChange: (crop) => onDraftCropChange(crop),
       onImageSelect: (im) => onSelectImage(im?.id ?? null),
       onImageCommit: (prev, next) => actions.commitImageEdit(prev.pageId, prev, next),
       onStroke: (st) => actions.commitStroke(st),
@@ -770,7 +828,11 @@ function Pane({
       activeLayerId: () => getActiveLayer(pageOf() ?? ''),
       getTexts: () => getTexts(pageOf() ?? ''),
       getImages: () => getImages(pageOf() ?? ''),
-      getSelectedImageId: () => (active ? selectedImageId : null),
+      getSelectedImageId: () => (activeRef.current ? selectedImageIdRef.current : null),
+      isImageEditMode: () => activeRef.current && (isImageEditModeRef.current || !!selectedImageIdRef.current),
+      getCroppingImageId: () => (activeRef.current ? croppingImageIdRef.current : null),
+      getDraftCrop: () => (activeRef.current ? draftCropRef.current : null),
+      onDraftCropChange: (crop) => onDraftCropChange(crop),
       onImageSelect: (im) => onSelectImage(im?.id ?? null),
       onImageCommit: (prev, next) => actions.commitImageEdit(prev.pageId, prev, next),
       onStroke: (st) => actions.commitStroke(st),
@@ -825,6 +887,10 @@ function Pane({
   useEffect(() => {
     surf.current?.invalidate();
   }, [paper]);
+  useEffect(() => {
+    surf.current?.invalidate();
+    zSurf.current?.invalidate();
+  }, [active, selectedImageId, isImageEditMode, croppingImageId, draftCrop, version]);
   useEffect(() => {
     if (kind !== 'lasso') surf.current?.clearSelection();
   }, [kind]);
@@ -1075,6 +1141,10 @@ function Pane({
                     }}
                     selectedImageId={selectedImageId}
                     onSelectImage={onSelectImage}
+                    isImageEditMode={isImageEditMode}
+                    croppingImageId={croppingImageId}
+                    draftCrop={draftCrop}
+                    onDraftCropChange={onDraftCropChange}
                     onPinchZoom={handleContinuousPinch}
                   />
                   {pageIdx < pages.length - 1 && (
@@ -1558,7 +1628,7 @@ interface ToolbarItemConfig {
   visible: boolean;
 }
 
-const TOOLBAR_CONFIG_KEY = 'mynotes.toolbarConfig.v1';
+const TOOLBAR_CONFIG_KEY = 'mynotes.toolbarConfig.v2';
 const PINNED_PAGES_KEY = 'mynotes.pinnedPages.v1';
 
 const DEFAULT_TOOLBAR_ITEMS: ToolbarItemConfig[] = [
@@ -1566,13 +1636,13 @@ const DEFAULT_TOOLBAR_ITEMS: ToolbarItemConfig[] = [
   { id: 'highlighter', label: 'Highlighter Tool', visible: true },
   { id: 'eraser', label: 'Eraser Tool', visible: true },
   { id: 'lasso', label: 'Lasso Tool', visible: true },
+  { id: 'image', label: 'Add Image', visible: true },
+  { id: 'shape', label: 'Shape', visible: true },
   { id: 'hand', label: 'Hand Tool', visible: true },
   { id: 'laser', label: 'Presentation Tool', visible: true },
   { id: 'text', label: 'Text Tool', visible: false },
   { id: 'page', label: 'Page', visible: false },
-  { id: 'image', label: 'Image', visible: false },
-  { id: 'shape', label: 'Shape', visible: false },
-  { id: 'insert', label: 'Insert', visible: true },
+  { id: 'insert', label: 'Insert', visible: false },
 ];
 
 function loadToolbarConfig(): ToolbarItemConfig[] {
@@ -1614,8 +1684,12 @@ export function Editor() {
 
   const editorRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const pendingInsertPageIdRef = useRef<string | null>(null);
   const moreBtnRef = useRef<HTMLButtonElement>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const [isImageEditMode, setIsImageEditMode] = useState(false);
+  const [croppingImageId, setCroppingImageId] = useState<string | null>(null);
+  const [draftCrop, setDraftCrop] = useState<ImageCrop | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [toolbarItems, setToolbarItems] = useState<ToolbarItemConfig[]>(() => loadToolbarConfig());
   const [showCustomizeToolbar, setShowCustomizeToolbar] = useState(false);
@@ -1712,10 +1786,53 @@ export function Editor() {
   const allCurrentImages = curPage ? getImages(curPage.id) : [];
   const selectedImage = selectedImageId ? allCurrentImages.find((im) => im.id === selectedImageId) ?? null : null;
 
+  useEffect(() => {
+    if (!selectedImage && croppingImageId) {
+      setCroppingImageId(null);
+      setDraftCrop(null);
+    }
+  }, [selectedImage, croppingImageId]);
+
+  const openImagePicker = () => {
+    pendingInsertPageIdRef.current = curPage?.id ?? curPages[0]?.id ?? null;
+    imageInputRef.current?.click();
+  };
+
+  const decodeImageDimensions = async (imgFile: File): Promise<{ width: number; height: number }> => {
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(imgFile);
+        const dims = { width: bmp.width, height: bmp.height };
+        bmp.close();
+        if (dims.width > 0 && dims.height > 0) return dims;
+      } catch {
+        // fallback to HTMLImageElement
+      }
+    }
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(imgFile);
+      const imgEl = new Image();
+      imgEl.onload = () => {
+        const width = imgEl.naturalWidth || imgEl.width;
+        const height = imgEl.naturalHeight || imgEl.height;
+        URL.revokeObjectURL(url);
+        if (width > 0 && height > 0) resolve({ width, height });
+        else reject(new Error('Image has invalid dimensions.'));
+      };
+      imgEl.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Selected file could not be decoded as an image.'));
+      };
+      imgEl.src = url;
+    });
+  };
+
   const handleInsertImageFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
     e.target.value = '';
+    const capturedPageId = pendingInsertPageIdRef.current;
+    pendingInsertPageIdRef.current = null;
+    if (!file) return;
 
     if (!file.type.startsWith('image/') && !/\.(png|jpe?g|webp|gif|svg|bmp|avif)$/i.test(file.name)) {
       alert('Please select a valid image file (PNG, JPEG, WebP, GIF, or SVG).');
@@ -1725,6 +1842,11 @@ export function Editor() {
     setBusyMsg('Importing image…');
     const endJob = beginEssentialJob('image-import');
     try {
+      const { width: naturalW, height: naturalH } = await decodeImageDimensions(file);
+      const targetPage =
+        (capturedPageId ? curPages.find((p) => p.id === capturedPageId) : undefined) ?? curPage ?? curPages[0];
+      if (!targetPage) throw new Error('No active page to place image.');
+
       const arrayBuf = await file.arrayBuffer();
       const bytes = new Uint8Array(arrayBuf);
       const sha256 = await sha256Hex(bytes);
@@ -1742,36 +1864,22 @@ export function Editor() {
         createdAt: Date.now(),
       });
 
-      // Decode natural dimensions
-      let naturalW = 400;
-      let naturalH = 300;
-      if (typeof createImageBitmap === 'function') {
-        try {
-          const bmp = await createImageBitmap(file);
-          naturalW = bmp.width;
-          naturalH = bmp.height;
-          bmp.close();
-        } catch {
-          /* fallback */
-        }
-      }
-
       const aspectRatio = Math.max(0.05, naturalW / Math.max(1, naturalH));
-      const targetPage = curPage ?? curPages[0];
-      if (!targetPage) throw new Error('No active page to place image.');
-
       const pW = targetPage.width;
       const pH = targetPage.height;
       const padX = 36;
-      let initW = Math.min(pW - padX * 2, 380);
+      const padY = 48;
+      const maxW = Math.min(Math.max(120, pW - padX * 2), 420);
+      const maxH = Math.min(Math.max(120, pH - padY * 2), pH * 0.55);
+      let initW = maxW;
       let initH = initW / aspectRatio;
-      if (initH > pH * 0.5) {
-        initH = pH * 0.5;
+      if (initH > maxH) {
+        initH = maxH;
         initW = initH * aspectRatio;
       }
 
       const x0 = Math.max(0, (pW - initW) / 2);
-      const y0 = 60; // Placed toward top so user has writing room underneath!
+      const y0 = Math.max(24, Math.min(60, (pH - initH) / 2));
       const activeLayerId = getActiveLayer(targetPage.id) ?? targetPage.layerIds[0];
 
       const newImg: ImageBox = {
@@ -1782,13 +1890,21 @@ export function Editor() {
         assetId,
         bounds: { x0, y0, x1: x0 + initW, y1: y0 + initH },
         aspectRatio,
+        naturalAspectRatio: aspectRatio,
+        crop: { left: 0, top: 0, right: 0, bottom: 0 },
         opacity: 1,
         order: Date.now(),
         revision: 1,
       };
 
       actions.commitImageEdit(targetPage.id, null, newImg);
+      if (cur?.pageId !== targetPage.id) {
+        actions.setPage(s.activePane, targetPage.id);
+      }
       setSelectedImageId(newImg.id);
+      setIsImageEditMode(true);
+      setCroppingImageId(null);
+      setDraftCrop(null);
     } catch (err) {
       alert(`Image import failed: ${(err as Error).message}`);
     } finally {
@@ -1837,13 +1953,14 @@ export function Editor() {
   const fitSelectedImageWidth = () => {
     if (!selectedImage || !curPage) return;
     const pad = 36;
-    const newW = Math.max(100, curPage.width - pad * 2);
+    let newW = Math.max(100, curPage.width - pad * 2);
     const ar = selectedImage.aspectRatio || 1;
     let newH = newW / ar;
     if (newH > curPage.height - 72) {
       newH = curPage.height - 72;
+      newW = newH * ar;
     }
-    const x0 = pad;
+    const x0 = Math.max(0, (curPage.width - newW) * 0.5);
     const y0 = Math.max(20, Math.min(curPage.height - newH - 20, selectedImage.bounds.y0));
     const next: ImageBox = {
       ...selectedImage,
@@ -1865,9 +1982,51 @@ export function Editor() {
     actions.commitImageEdit(curPage.id, selectedImage, next);
   };
 
+  const startCropSelectedImage = () => {
+    if (!selectedImage) return;
+    setDraftCrop(normalizeImageCrop(selectedImage.crop));
+    setCroppingImageId(selectedImage.id);
+  };
+
+  const applyCropSelectedImage = () => {
+    if (!selectedImage || !curPage) return;
+    const full = getFullImageBounds(selectedImage);
+    const nextCrop = normalizeImageCrop(draftCrop ?? selectedImage.crop);
+    const nextBounds = getCropBoxBounds(full, nextCrop);
+    const nextAr = Math.max(0.05, (nextBounds.x1 - nextBounds.x0) / Math.max(1, nextBounds.y1 - nextBounds.y0));
+    const nextImg: ImageBox = {
+      ...selectedImage,
+      bounds: nextBounds,
+      aspectRatio: nextAr,
+      crop: isDefaultImageCrop(nextCrop) ? undefined : nextCrop,
+      revision: selectedImage.revision + 1,
+    };
+    actions.commitImageEdit(curPage.id, selectedImage, nextImg);
+    setCroppingImageId(null);
+    setDraftCrop(null);
+  };
+
+  const resetCropSelectedImage = () => {
+    setDraftCrop({ left: 0, top: 0, right: 0, bottom: 0 });
+  };
+
+  const cancelCropSelectedImage = () => {
+    setCroppingImageId(null);
+    setDraftCrop(null);
+  };
+
+  const finishImageEditing = () => {
+    setCroppingImageId(null);
+    setDraftCrop(null);
+    setSelectedImageId(null);
+    setIsImageEditMode(false);
+  };
+
   const deleteSelectedImage = () => {
     if (!selectedImage || !curPage) return;
     actions.commitImageEdit(curPage.id, selectedImage, null);
+    setCroppingImageId(null);
+    setDraftCrop(null);
     setSelectedImageId(null);
   };
 
@@ -2572,10 +2731,10 @@ export function Editor() {
             className="nav-row"
             onClick={() => {
               setPop(null);
-              imageInputRef.current?.click();
+              openImagePicker();
             }}
           >
-            <ImageIcon size={16} /> <span>Insert Image</span>
+            <ImageIcon size={16} /> <span>Add Image</span>
           </button>
           <button role="menuitem" className="nav-row" onClick={() => {
             setPop(null);
@@ -2658,7 +2817,7 @@ export function Editor() {
                 case 'text':
                   return <Fragment key="text">{tbtn('text', 'Text box & Scribble', <Type size={22} />)}</Fragment>;
                 case 'shape':
-                  return <Fragment key="shape">{tbtn('shape', 'Shape', <Shapes size={22} />)}</Fragment>;
+                  return <Fragment key="shape">{tbtn('shape', 'Shapes', <Shapes size={22} />, 'shape')}</Fragment>;
                 case 'page':
                   return (
                     <button
@@ -2676,9 +2835,9 @@ export function Editor() {
                     <button
                       key="image"
                       className="tool"
-                      aria-label="Insert image"
-                      title="Insert image (question photo, diagram, scan)"
-                      onClick={() => imageInputRef.current?.click()}
+                      aria-label="Add Image"
+                      title="Add Image from Gallery"
+                      onClick={openImagePicker}
                     >
                       <ImageIcon size={22} />
                     </button>
@@ -2694,9 +2853,23 @@ export function Editor() {
             style={{ display: 'none' }}
             onChange={handleInsertImageFile}
           />
-          {tbtn('hand', 'Hand (pan)', <Hand size={22} />)}
-          {tbtn('laser', 'Laser pointer', <Sparkles size={22} />)}
-          {tbtn('shape', 'Shapes', <Shapes size={22} />, 'shape')}
+          {(allCurrentImages.length > 0 || isImageEditMode) && (
+            <button
+              className={`tool ${isImageEditMode ? 'sel' : ''}`}
+              aria-label="Edit Images"
+              aria-pressed={isImageEditMode}
+              title={isImageEditMode ? 'Done editing images' : 'Select, move, resize, or crop images'}
+              onClick={() => {
+                if (isImageEditMode) {
+                  finishImageEditing();
+                } else {
+                  setIsImageEditMode(true);
+                }
+              }}
+            >
+              <Crop size={20} />
+            </button>
+          )}
           <button
             className={`tool ${T.penOnly ? 'sel' : ''}`}
             aria-label="Pen only: reject finger ink"
@@ -2824,7 +2997,19 @@ export function Editor() {
               <Pane
                 index={i}
                 selectedImageId={selectedImageId}
-                onSelectImage={setSelectedImageId}
+                onSelectImage={(id) => {
+                  setSelectedImageId(id);
+                  if (!id) {
+                    setCroppingImageId(null);
+                    setDraftCrop(null);
+                  } else {
+                    setIsImageEditMode(true);
+                  }
+                }}
+                isImageEditMode={isImageEditMode}
+                croppingImageId={croppingImageId}
+                draftCrop={draftCrop}
+                onDraftCropChange={setDraftCrop}
                 onRequestUnlockPage={(pg) =>
                   setPwModal({
                     mode: 'unlock',
@@ -2939,7 +3124,46 @@ export function Editor() {
         />
       )}
 
-      {selectedImage && (
+      {selectedImage && croppingImageId === selectedImage.id && (
+        <div
+          className="sel-menu image-toolbar"
+          role="toolbar"
+          aria-label="Crop image actions"
+          style={{
+            position: 'fixed',
+            bottom: 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 40,
+            maxWidth: 'calc(100vw - 24px)',
+            flexWrap: 'wrap',
+            background: 'rgba(28, 28, 30, 0.94)',
+            backdropFilter: 'blur(16px)',
+            border: '1px solid var(--line)',
+            borderRadius: 14,
+            padding: '6px 12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+          }}
+        >
+          <span style={{ fontSize: 12, color: 'var(--muted)', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+            <Crop size={15} /> Drag handles to crop
+          </span>
+          <button className="chip" aria-label="Reset crop" onClick={resetCropSelectedImage} title="Restore full image">
+            <RotateCcw size={14} /> Reset
+          </button>
+          <button className="chip" aria-label="Cancel crop" onClick={cancelCropSelectedImage} title="Cancel crop">
+            <X size={14} /> Cancel
+          </button>
+          <button className="nn-create" aria-label="Apply crop" onClick={applyCropSelectedImage} title="Apply crop">
+            <Check size={15} /> Apply
+          </button>
+        </div>
+      )}
+
+      {selectedImage && croppingImageId !== selectedImage.id && (
         <div
           className="sel-menu image-toolbar"
           role="toolbar"
@@ -2950,6 +3174,8 @@ export function Editor() {
             left: '50%',
             transform: 'translateX(-50%)',
             zIndex: 40,
+            maxWidth: 'calc(100vw - 24px)',
+            flexWrap: 'wrap',
             background: 'rgba(28, 28, 30, 0.94)',
             backdropFilter: 'blur(16px)',
             border: '1px solid var(--line)',
@@ -2971,8 +3197,17 @@ export function Editor() {
               marginRight: 4,
             }}
           >
-            <ImageIcon size={15} /> Question Image
+            <ImageIcon size={15} /> Photo
           </span>
+          <button
+            className="chip"
+            aria-label="Crop image"
+            title="Crop image"
+            onClick={startCropSelectedImage}
+          >
+            <Crop size={14} /> Crop
+          </button>
+          <span style={{ width: 1, height: 16, background: 'var(--line)' }} />
           <div style={{ display: 'inline-flex', gap: 2, alignItems: 'center' }} title="Nudge position">
             <button className="icon xs" aria-label="Nudge left" onClick={() => nudgeSelectedImage(-20, 0)}>
               <ArrowLeft size={14} />
@@ -3018,12 +3253,48 @@ export function Editor() {
             <Trash2 size={16} />
           </button>
           <button
-            className="icon xs"
-            aria-label="Deselect image"
+            className="nn-create"
+            aria-label="Done editing image"
             title="Done"
-            onClick={() => setSelectedImageId(null)}
+            onClick={finishImageEditing}
           >
-            <X size={16} />
+            <Check size={15} /> Done
+          </button>
+        </div>
+      )}
+
+      {!selectedImage && isImageEditMode && (
+        <div
+          className="sel-menu image-toolbar"
+          role="toolbar"
+          aria-label="Image editing mode"
+          style={{
+            position: 'fixed',
+            bottom: 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 40,
+            maxWidth: 'calc(100vw - 24px)',
+            flexWrap: 'wrap',
+            background: 'rgba(28, 28, 30, 0.94)',
+            backdropFilter: 'blur(16px)',
+            border: '1px solid var(--line)',
+            borderRadius: 14,
+            padding: '6px 12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+          }}
+        >
+          <span style={{ fontSize: 12, color: 'var(--muted)', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+            <ImageIcon size={15} /> Tap a photo to select
+          </span>
+          <button className="chip" aria-label="Add another image" onClick={openImagePicker}>
+            <Plus size={14} /> Add Image
+          </button>
+          <button className="nn-create" aria-label="Done image editing" onClick={finishImageEditing}>
+            <Check size={15} /> Done
           </button>
         </div>
       )}

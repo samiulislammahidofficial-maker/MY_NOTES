@@ -561,6 +561,7 @@ const target: StrokeTarget = {
     pageNotebook.set(page.id, notebookId);
     if (!strokesByPage.has(page.id)) strokesByPage.set(page.id, []);
     if (!textsByPage.has(page.id)) textsByPage.set(page.id, []);
+    if (!imagesByPage.has(page.id)) imagesByPage.set(page.id, []);
     if (!layersByPage.has(page.id)) layersByPage.set(page.id, [layer]);
 
     const curPageIds = nb.pageIds.includes(page.id) ? [...nb.pageIds] : [...nb.pageIds];
@@ -604,8 +605,8 @@ const target: StrokeTarget = {
   removeAddedPage(notebookId, pageId, fallbackPageId) {
     const nb = get().notebooks.find((n) => n.id === notebookId);
     if (!nb || nb.pageIds.length <= 1) return;
-    // Do not destroy subsequently written content if strokes or texts remain on this page
-    if (getStrokes(pageId).length > 0 || getTexts(pageId).length > 0) return;
+    // Do not destroy subsequently written content if strokes, texts, or images remain on this page
+    if (getStrokes(pageId).length > 0 || getTexts(pageId).length > 0 || getImages(pageId).length > 0) return;
     const nextPageIds = nb.pageIds.filter((id) => id !== pageId);
     const nextPages = getPages(notebookId).filter((p) => p.id !== pageId);
     pagesByNotebook.set(notebookId, nextPages);
@@ -739,6 +740,7 @@ export const actions = {
             if (msg.pageId) {
               strokesByPage.delete(msg.pageId);
               textsByPage.delete(msg.pageId);
+              imagesByPage.delete(msg.pageId);
             }
             await actions.loadNotebook(msg.notebookId);
             set((st) => ({ strokeVersion: st.strokeVersion + 1 }));
@@ -788,6 +790,9 @@ export const actions = {
           await repo.replaceStrokes(strokes.map((s) => s.id), strokes, nbId);
           for (const tb of getTexts(pageId)) {
             await repo.putText(tb, nbId);
+          }
+          for (const im of getImages(pageId)) {
+            await repo.putImage(im, nbId);
           }
         }
         dirtyPages.delete(pageId);

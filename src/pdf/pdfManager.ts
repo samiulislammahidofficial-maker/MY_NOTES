@@ -1,10 +1,18 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { PDFDocument, rgb } from 'pdf-lib';
+import {
+  PDFDocument,
+  clip,
+  endPath,
+  popGraphicsState,
+  pushGraphicsState,
+  rectangle,
+  rgb,
+} from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import type { AssetRecord, ImageBox, InkStroke, Layer, Notebook, Page, TextBox } from '../domain/types';
-import { isDark, SAMPLE_STRIDE } from '../domain/types';
-import { centerlinePath, createRainbowStyle, strokePath } from '../engine/render';
+import { getFullImageBounds, isDark, isDefaultImageCrop, normalizeImageCrop, SAMPLE_STRIDE } from '../domain/types';
+import { centerlinePath, cleanStrokeSamples, createRainbowStyle, strokePath } from '../engine/render';
 import { repo } from '../storage/db';
 import { blobStore, sha256Hex } from '../storage/blobStore';
 
@@ -475,13 +483,34 @@ export async function exportNotebookToPdfBytes(
       if (embedded) {
         const w = img.bounds.x1 - img.bounds.x0;
         const h = img.bounds.y1 - img.bounds.y0;
-        pdfPage.drawImage(embedded, {
-          x: img.bounds.x0,
-          y: H - img.bounds.y1,
-          width: w,
-          height: h,
-          opacity: (img.opacity ?? 1) * (l?.opacity ?? 1),
-        });
+        const opacity = (img.opacity ?? 1) * (l?.opacity ?? 1);
+        if (!isDefaultImageCrop(img.crop)) {
+          const full = getFullImageBounds(img);
+          const fw = full.x1 - full.x0;
+          const fh = full.y1 - full.y0;
+          pdfPage.pushOperators(
+            pushGraphicsState(),
+            rectangle(img.bounds.x0, H - img.bounds.y1, w, h),
+            clip(),
+            endPath(),
+          );
+          pdfPage.drawImage(embedded, {
+            x: full.x0,
+            y: H - full.y1,
+            width: fw,
+            height: fh,
+            opacity,
+          });
+          pdfPage.pushOperators(popGraphicsState());
+        } else {
+          pdfPage.drawImage(embedded, {
+            x: img.bounds.x0,
+            y: H - img.bounds.y1,
+            width: w,
+            height: h,
+            opacity,
+          });
+        }
       }
     }
 
@@ -491,12 +520,13 @@ export async function exportNotebookToPdfBytes(
       if (l && !l.visible) continue;
       const c = hexToRgb01(s.color);
       const alpha = s.opacity * (l?.opacity ?? 1);
-      const n = s.samples.length / SAMPLE_STRIDE;
+      const cleaned = cleanStrokeSamples(s.samples, s.width);
+      const n = cleaned.length / SAMPLE_STRIDE;
       for (let i = 0; i < n - 1; i++) {
         const o = i * SAMPLE_STRIDE, q = o + SAMPLE_STRIDE;
         pdfPage.drawLine({
-          start: { x: s.samples[o], y: H - s.samples[o + 1] },
-          end: { x: s.samples[q], y: H - s.samples[q + 1] },
+          start: { x: cleaned[o], y: H - cleaned[o + 1] },
+          end: { x: cleaned[q], y: H - cleaned[q + 1] },
           thickness: s.width,
           color: rgb(c.r, c.g, c.b),
           opacity: alpha,
@@ -716,10 +746,19 @@ export async function renderPageToCanvas(
     if (entry && !entry.layer.visible) continue;
     const el = await getScannedImageElement(img.assetId).catch(() => null);
     if (!el) continue;
+    const crop = normalizeImageCrop(img.crop);
+    const sx = crop.left * el.naturalWidth;
+    const sy = crop.top * el.naturalHeight;
+    const sw = Math.max(1, (1 - crop.left - crop.right) * el.naturalWidth);
+    const sh = Math.max(1, (1 - crop.top - crop.bottom) * el.naturalHeight);
     ctx.save();
     ctx.globalAlpha = (img.opacity ?? 1) * (entry?.layer.opacity ?? 1);
     ctx.drawImage(
       el,
+      sx,
+      sy,
+      sw,
+      sh,
       img.bounds.x0,
       img.bounds.y0,
       img.bounds.x1 - img.bounds.x0,
